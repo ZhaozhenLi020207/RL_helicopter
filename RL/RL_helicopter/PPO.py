@@ -17,9 +17,9 @@ if __name__ == "__main__":
         verbose=1
     )
 
-    # 3. 训练（论文建议至少5万步）
-    print("开始训练直升机入库模型（论文运动学）...")
-    model.learn(total_timesteps=50000)
+    # 3. 训练（至少5万步）
+    print("开始训练直升机入库模型...")
+    model.learn(total_timesteps=500000)
 
     # 4. 测试+生成动画
     print("开始测试，生成入库动画...")

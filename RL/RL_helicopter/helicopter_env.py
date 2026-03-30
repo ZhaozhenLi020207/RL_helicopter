@@ -15,8 +15,8 @@ class HelicopterInboundEnv(gym.Env):
     def __init__(self, render_mode=None):
         super().__init__()
 
-        self.L_PFM = 3.0  # 牵引杆P到前轮中点FM的距离
-        self.max_steps = 500  # 最大入库步数
+        self.L_PFM = 0.198  # 牵引杆P到前轮中点FM的距离
+        self.max_steps = 50000  # 最大入库步数
         self.render_mode = render_mode
 
         # 轨道参数
@@ -29,14 +29,14 @@ class HelicopterInboundEnv(gym.Env):
         # 动作空间
         # 动作定义：0=左横移(-0.05m/s)+慢牵(0.1m/s)，1=无横移+中牵(0.3m/s)，2=右横移(+0.05m/s)+快牵(0.5m/s)
         self.action_space = spaces.Discrete(3)
-        self.vx_options = [-0.05, 0.0, 0.05]  # 横移速度（垂直轨道）
-        self.vy_options = [0.1, 0.3, 0.5]    # 牵引速度（沿轨道，向机库移动y减小）
+        self.vx_options = [-0.03, 0.0, 0.03]  # 横移速度（垂直轨道）
+        self.vy_options = [0.05, 0.1, 0.15]    # 牵引速度（沿轨道，向机库移动y减小）
 
         # 观测空间
         # 观测维度：[前轮相对轨道偏差, 机身偏角, 牵引杆相对轨道偏差]
         self.observation_space = spaces.Box(
-            low=np.array([-1.0, -np.pi/15, -1.0], dtype=np.float32),  # 偏差±1m，偏角±12°
-            high=np.array([1.0, np.pi/15, 1.0], dtype=np.float32),
+            low=np.array([-0.008, -np.pi/15, -1.0], dtype=np.float32),  # 偏差±0.008m，偏角±12°
+            high=np.array([0.008, np.pi/15, 1.0], dtype=np.float32),
             dtype=np.float32
         )
 
@@ -55,7 +55,7 @@ class HelicopterInboundEnv(gym.Env):
             # 直道1：x=0
             return 0.0
         elif y >= self.y_curve_end:
-            # 弯道：余弦平滑过渡（论文5.5.2优化轨道）
+            # 弯道：余弦平滑过渡
             t = (self.y_curve_start - y) / (self.y_curve_start - self.y_curve_end)
             return self.curve_dx * (1 - np.cos(np.pi * t)) / 2
         else:
@@ -71,7 +71,7 @@ class HelicopterInboundEnv(gym.Env):
         # 初始位姿：直道1上，前轮中点在轨道附近偏移
         self.y_fm = self.np_random.uniform(self.y_start - 2.0, self.y_start)
         track_x = self.track_centerline(self.y_fm)
-        self.x_fm = track_x + self.np_random.uniform(-0.6, 0.6)  # 初始横移偏差±0.6m
+        self.x_fm = track_x + self.np_random.uniform(-0.06, 0.06)  # 初始横移偏差±0.06m
         self.theta = self.np_random.uniform(-np.pi/15, np.pi/15)  # 初始偏角±12°
 
         # 牵引杆P的初始位置
@@ -86,7 +86,7 @@ class HelicopterInboundEnv(gym.Env):
         ], dtype=np.float32)
         return obs, {}
 
-    # 步进函数
+        # 步进函数
     def step(self, action):
         self.current_steps += 1
         # 1. 解析动作（横移速度vx，牵引速度vy）
@@ -97,7 +97,7 @@ class HelicopterInboundEnv(gym.Env):
         dt = 0.1  # 控制步长
         # 机身角速度（耦合vx、vy、theta）
         omega = (vx * np.cos(self.theta) - vy * np.sin(self.theta)) / self.L_PFM
-        # 更新前轮位置
+        # 更新尾轮位置
         self.x_fm += (vx - self.L_PFM * omega * np.sin(self.theta)) * dt
         self.y_fm -= vy * dt  # 向机库移动，y减小
         # 更新机身偏角（限制在±12°）
@@ -113,7 +113,7 @@ class HelicopterInboundEnv(gym.Env):
 
         # 4. 奖励函数（引导平稳入库）
         reward = 0.0
-        # 惩罚偏差：前轮偏差权重1，牵引杆偏差权重0.5，机身偏角权重2（论文优先级）
+        # 惩罚偏差：前轮偏差权重1，牵引杆偏差权重0.5，机身偏角权重2
         reward -= abs(e_fm) + 0.5 * abs(e_p) + 2 * abs(self.theta)
         # 奖励速度：牵引速度越快，奖励越高（鼓励快速入库）
         reward += 0.1 * vy
@@ -143,9 +143,9 @@ class HelicopterInboundEnv(gym.Env):
             return
 
         fig, ax = plt.subplots(figsize=(10, 8))
-        ax.set_xlim(-1.5, 2.5)  # 横移范围
-        ax.set_ylim(-2.0, 35.0)  # 沿轨道范围
-        ax.set_title("直升机牵引入库成功动画（论文运动学模型）")
+        ax.set_xlim(-0.19, 0.19)  # 横移范围
+        ax.set_ylim(-0.5, 3.5)  # 沿轨道范围
+        ax.set_title("直升机牵引入库成功图")
         ax.set_xlabel("横移位置 (m)")
         ax.set_ylabel("沿轨道位置 (m)")
         ax.grid(True)
@@ -156,17 +156,18 @@ class HelicopterInboundEnv(gym.Env):
         ax.plot(xs, ys, 'k-', lw=2, label="牵引轨道")
 
         # 2. 绘制机库（定义：直道2末端，x∈[0.0,1.0], y∈[0.0,5.0]）
-        hangar = Rectangle((0.0, 0.0), 1.0, 5.0, linewidth=2, edgecolor='red', facecolor='none', label="机库")
+        hangar = Rectangle((0.0, 0.0), 0.5, 1.3, linewidth=2, edgecolor='red', facecolor='none', label="机库")
         ax.add_patch(hangar)
 
-        # 3. 绘制直升机（黑色三角形+三个红点轮胎，你的要求）
-        tri = Polygon(np.zeros((3, 2)), closed=True, color='black', alpha=0.8, label="直升机机身")
+        # 3. 绘制直升机（黑色倒三角形+尾轮三个红点，尖头朝后为尾部，前进方向朝前）
+        tri = Polygon(np.array([[0, -1.244], [-0.09, 0], [0.09, 0]]), closed=True, color='black', alpha=0.8,
+                      label="直升机机身")
         ax.add_patch(tri)
-        # 轮胎：前轮到机身前端1m，左右轮间距0.8m（机身尺寸）
-        t_front = Circle((0, 0), 0.12, color='red', label="前轮")
-        t_left = Circle((0, 0), 0.12, color='red', label="左后轮")
-        t_right = Circle((0, 0), 0.12, color='red', label="右后轮")
-        ax.add_patch(t_front)
+        # 尾轮（布置在尾部尖头处，左右间距0.18m）
+        t_back = Circle((0, -0.498), 0.12, color='red', label="尾中轮")
+        t_left = Circle((-0.09, 0), 0.12, color='red', label="尾左轮")
+        t_right = Circle((0.09, 0), 0.12, color='red', label="尾右轮")
+        ax.add_patch(t_back)
         ax.add_patch(t_left)
         ax.add_patch(t_right)
 
@@ -180,17 +181,17 @@ class HelicopterInboundEnv(gym.Env):
 
         def update(frame):
             x_fm, y_fm, theta, x_p, y_p = frame
-            # 机身三个顶点：前端（前轮前方1m）、左后端、右后端
-            front_x = x_fm + 1.0 * np.cos(theta)
-            front_y = y_fm + 1.0 * np.sin(theta)
-            left_rear_x = x_fm - 2.0 * np.cos(theta) - 0.4 * np.sin(theta)
-            left_rear_y = y_fm - 2.0 * np.sin(theta) + 0.4 * np.cos(theta)
-            right_rear_x = x_fm - 2.0 * np.cos(theta) + 0.4 * np.sin(theta)
-            right_rear_y = y_fm - 2.0 * np.sin(theta) - 0.4 * np.cos(theta)
+            # 机身三个顶点：前端、左后端、右后端
+            front_x = x_fm + 0.498 * np.cos(theta)
+            front_y = y_fm + 0.498 * np.sin(theta)
+            left_rear_x = x_fm - 0.996 * np.cos(theta) - 0.09 * np.sin(theta)
+            left_rear_y = y_fm - 0.996 * np.sin(theta) + 0.09 * np.cos(theta)
+            right_rear_x = x_fm - 0.996 * np.cos(theta) + 0.09 * np.sin(theta)
+            right_rear_y = y_fm - 0.996 * np.sin(theta) - 0.09 * np.cos(theta)
 
             # 更新机身和轮胎位置
             tri.set_xy([(front_x, front_y), (left_rear_x, left_rear_y), (right_rear_x, right_rear_y)])
-            t_front.set_center((x_fm, y_fm))
+            t_back.set_center((x_fm, y_fm))
             t_left.set_center((left_rear_x, left_rear_y))
             t_right.set_center((right_rear_x, right_rear_y))
 
@@ -204,7 +205,7 @@ class HelicopterInboundEnv(gym.Env):
             traj_ys = [f[1] for f in self.success_frames[:self.success_frames.index(frame)+1]]
             trajectory_line.set_data(traj_xs, traj_ys)
 
-            return tri, t_front, t_left, t_right, towbar, trajectory_line
+            return tri, t_back, t_left, t_right, towbar, trajectory_line
 
         ani = FuncAnimation(fig, update, frames=self.success_frames, interval=80, blit=True)
         ani.save(path, writer='pillow', fps=10)
@@ -217,17 +218,17 @@ class HelicopterInboundEnv(gym.Env):
             return
         plt.figure(figsize=(10, 8))
         ax = plt.gca()
-        ax.set_xlim(-1.5, 2.5)
-        ax.set_ylim(-2.0, 35.0)
+        ax.set_xlim(-0.19, 0.19)
+        ax.set_ylim(-0.5, 3.5)
         ax.plot([self.track_centerline(y) for y in np.linspace(0, 30, 200)], np.linspace(0, 30, 200), 'k-', lw=2)
-        ax.add_patch(Rectangle((0.0, 0.0), 1.0, 5.0, edgecolor='red', facecolor='none'))
+        ax.add_patch(Rectangle((0.0, 0.0), 0.5, 1.3, edgecolor='red', facecolor='none'))
         # 绘制直升机
-        front_x = self.x_fm + 1.0 * np.cos(self.theta)
-        front_y = self.y_fm + 1.0 * np.sin(self.theta)
-        left_rear_x = self.x_fm - 2.0 * np.cos(self.theta) - 0.4 * np.sin(self.theta)
-        left_rear_y = self.y_fm - 2.0 * np.sin(self.theta) + 0.4 * np.cos(self.theta)
-        right_rear_x = self.x_fm - 2.0 * np.cos(self.theta) + 0.4 * np.sin(self.theta)
-        right_rear_y = self.y_fm - 2.0 * np.sin(self.theta) - 0.4 * np.cos(self.theta)
+        front_x = self.x_fm + 0.498 * np.cos(self.theta)
+        front_y = self.y_fm + 0.996 * np.sin(self.theta)
+        left_rear_x = self.x_fm - 0.996 * np.cos(self.theta) - 0.09 * np.sin(self.theta)
+        left_rear_y = self.y_fm - 0.996 * np.sin(self.theta) + 0.09 * np.cos(self.theta)
+        right_rear_x = self.x_fm - 0.996 * np.cos(self.theta) + 0.09 * np.sin(self.theta)
+        right_rear_y = self.y_fm - 0.996 * np.sin(self.theta) - 0.09 * np.cos(self.theta)
         ax.fill([front_x, left_rear_x, right_rear_x], [front_y, left_rear_y, right_rear_y], 'black', alpha=0.8)
         ax.scatter([self.x_fm, left_rear_x, right_rear_x], [self.y_fm, left_rear_y, right_rear_y], c='red', s=30)
         # 绘制牵引杆
