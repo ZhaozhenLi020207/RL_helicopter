@@ -10,16 +10,19 @@ if __name__ == "__main__":
     model = PPO(
         policy="MlpPolicy",
         env=env,
-        learning_rate=3e-4,
+        learning_rate=5e-4,
         n_steps=2048,
+        clip_range=0.3,
         batch_size=64,
+        ent_coef=0.1,
         gamma=0.99,  # 折扣因子（鼓励长期入库）
         verbose=1
     )
 
-    # 3. 训练（至少5万步）
+    # 3. 训练（至少50万步）
     print("开始训练直升机入库模型...")
     model.learn(total_timesteps=500000)
+    model.save("helicopter_inbound")
 
     # 4. 测试+生成动画
     print("开始测试，生成入库动画...")
