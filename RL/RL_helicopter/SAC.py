@@ -1,6 +1,6 @@
 """
-基于SAC (Soft Actor-Critic)算法的直升机自动牵引入库训练
-SAC特点：最大熵框架、探索能力强、训练稳定
+基于SAC (Soft Actor-Critic)算法的直升机自动牵引入库训练（修正版）
+主要修正：坐标系统一、成功条件修正、动作空间匹配
 """
 
 import gymnasium as gym
@@ -22,7 +22,7 @@ from helicopter_env import HelicopterInboundKinematicsEnv
 class SoftQNetwork(nn.Module):
     """Soft Q网络（Critic）"""
 
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
         super().__init__()
 
         self.net = nn.Sequential(
@@ -39,9 +39,9 @@ class SoftQNetwork(nn.Module):
 
 
 class GaussianPolicy(nn.Module):
-    """高斯策略网络（Actor）- SAC使用重参数化技巧"""
+    """高斯策略网络（Actor）"""
 
-    def __init__(self, state_dim, action_dim, hidden_dim=256, action_scale=1.0, action_bias=0.0):
+    def __init__(self, state_dim, action_dim, hidden_dim=128, action_scale=1.0, action_bias=0.0):
         super().__init__()
 
         self.action_scale = action_scale
@@ -61,7 +61,7 @@ class GaussianPolicy(nn.Module):
         x = self.net(state)
         mean = self.mean_layer(x)
         log_std = self.log_std_layer(x)
-        log_std = torch.clamp(log_std, -20, 2)  # 限制标准差范围
+        log_std = torch.clamp(log_std, -20, 2)
         return mean, log_std
 
     def sample(self, state, deterministic=False):
@@ -73,15 +73,12 @@ class GaussianPolicy(nn.Module):
             log_prob = None
         else:
             normal = Normal(mean, std)
-            # 重参数化采样
-            z = normal.rsample()  # rsample支持梯度回传
-            action = torch.tanh(z)  # 限制动作范围[-1, 1]
+            z = normal.rsample()
+            action = torch.tanh(z)
 
-            # 计算log概率（考虑tanh变换）
             log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
             log_prob = log_prob.sum(dim=-1, keepdim=True)
 
-        # 缩放到实际动作空间
         action = action * self.action_scale + self.action_bias
 
         return action, log_prob
@@ -91,11 +88,9 @@ class GaussianPolicy(nn.Module):
         mean, log_std = self.forward(state)
         std = log_std.exp()
 
-        # 将动作反归一化到[-1, 1]范围
         action_normalized = (action - self.action_bias) / self.action_scale
         action_normalized = torch.clamp(action_normalized, -0.999, 0.999)
 
-        # 计算反tanh
         z = torch.atanh(action_normalized)
 
         normal = Normal(mean, std)
@@ -154,9 +149,10 @@ class SACAgent:
         self.config = config
         self.device = torch.device(config['device'])
 
-        # 动作空间边界
-        self.action_low = np.array([-1.0, 0.05])
-        self.action_high = np.array([1.0, 0.5])
+        # 动作空间边界（匹配环境）
+        # 环境动作: [vx_sign (-1~1), vy (0.02~0.1)]
+        self.action_low = np.array([-1.0, 0.02], dtype=np.float32)
+        self.action_high = np.array([1.0, 0.1], dtype=np.float32)
         self.action_scale = torch.FloatTensor((self.action_high - self.action_low) / 2).to(self.device)
         self.action_bias = torch.FloatTensor((self.action_high + self.action_low) / 2).to(self.device)
 
@@ -167,13 +163,11 @@ class SACAgent:
             self.action_scale, self.action_bias
         ).to(self.device)
 
-        # 两个Q网络（减少过估计）
         self.q1 = SoftQNetwork(state_dim, action_dim, config['hidden_dim']).to(self.device)
         self.q2 = SoftQNetwork(state_dim, action_dim, config['hidden_dim']).to(self.device)
         self.target_q1 = SoftQNetwork(state_dim, action_dim, config['hidden_dim']).to(self.device)
         self.target_q2 = SoftQNetwork(state_dim, action_dim, config['hidden_dim']).to(self.device)
 
-        # 复制参数到目标网络
         self.target_q1.load_state_dict(self.q1.state_dict())
         self.target_q2.load_state_dict(self.q2.state_dict())
 
@@ -183,7 +177,7 @@ class SACAgent:
         self.q2_optimizer = optim.Adam(self.q2.parameters(), lr=config['critic_lr'])
 
         # 自动调节温度系数α
-        self.target_entropy = -action_dim  # H* = -dim(A)
+        self.target_entropy = -action_dim
         self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
         self.alpha = self.log_alpha.exp()
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=config['alpha_lr'])
@@ -200,6 +194,7 @@ class SACAgent:
         self.episode_rewards = []
         self.episode_lengths = []
         self.training_losses = []
+        self.success_history = []
 
     def select_action(self, state, deterministic=False):
         """选择动作"""
@@ -208,6 +203,13 @@ class SACAgent:
         with torch.no_grad():
             action, _ = self.actor.sample(state, deterministic)
 
+        # 可选：添加小噪声增加探索（但保持精度）
+        if not deterministic and np.random.random() < 0.3:
+            noise = np.random.normal(0, 0.05, size=action.shape)
+            action = action.cpu().numpy()[0] + noise
+            action = np.clip(action, self.action_low, self.action_high)
+            return action
+
         return action.cpu().numpy()[0]
 
     def update(self):
@@ -215,22 +217,17 @@ class SACAgent:
         if len(self.buffer) < self.config['batch_size']:
             return
 
-        # 采样
         states, actions, rewards, next_states, dones = self.buffer.sample(
             self.config['batch_size']
         )
 
         with torch.no_grad():
-            # 采样下一个动作（使用当前策略）
             next_actions, next_log_probs = self.actor.sample(next_states)
-
-            # 计算目标Q值
             target_q1 = self.target_q1(next_states, next_actions)
             target_q2 = self.target_q2(next_states, next_actions)
             target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_probs
             target_q = rewards + self.config['gamma'] * (1 - dones) * target_q
 
-        # 更新Q网络
         current_q1 = self.q1(states, actions)
         current_q2 = self.q2(states, actions)
 
@@ -239,13 +236,14 @@ class SACAgent:
 
         self.q1_optimizer.zero_grad()
         q1_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q1.parameters(), 0.5)
         self.q1_optimizer.step()
 
         self.q2_optimizer.zero_grad()
         q2_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q2.parameters(), 0.5)
         self.q2_optimizer.step()
 
-        # 更新Actor网络
         new_actions, log_probs = self.actor.sample(states)
         q1_new = self.q1(states, new_actions)
         q2_new = self.q2(states, new_actions)
@@ -255,9 +253,9 @@ class SACAgent:
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
         self.actor_optimizer.step()
 
-        # 更新温度系数α
         alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
 
         self.alpha_optimizer.zero_grad()
@@ -266,14 +264,12 @@ class SACAgent:
 
         self.alpha = self.log_alpha.exp()
 
-        # 软更新目标网络
         tau = self.config['tau']
         for target_param, param in zip(self.target_q1.parameters(), self.q1.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
         for target_param, param in zip(self.target_q2.parameters(), self.q2.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
-        # 记录损失
         self.training_losses.append({
             'q1_loss': q1_loss.item(),
             'q2_loss': q2_loss.item(),
@@ -291,7 +287,6 @@ class SACAgent:
             'q2_state_dict': self.q2.state_dict(),
             'target_q1_state_dict': self.target_q1.state_dict(),
             'target_q2_state_dict': self.target_q2.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'log_alpha': self.log_alpha,
         }, path)
         print(f"模型已保存至: {path}")
@@ -311,33 +306,36 @@ class SACAgent:
 
 # ========== 训练环境包装器 ==========
 class TrainingWrapper(gym.Wrapper):
-    """训练环境包装器"""
+    """训练环境包装器（简化版）"""
 
     def __init__(self, env, config):
         super().__init__(env)
         self.config = config
         self.last_action = np.zeros(2)
+        self.last_e_fm = None
+        self.last_theta_rel = None
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-
-        # 奖励塑形
         e_fm, theta_rel, e_p, tail_angle, y_remaining = obs
 
-        # 平滑控制奖励
+        # 移除额外的奖励塑形，让环境自己的奖励函数起作用
+        # 只保留轻微的动作平滑奖励
         action_change = np.abs(action - self.last_action).sum()
-        if action_change < 0.1:
-            reward += 0.05
-        self.last_action = action.copy()
+        if action_change < 0.05:
+            reward += 0.01
 
-        # 时间惩罚
-        reward -= 0.005
+        self.last_e_fm = e_fm
+        self.last_theta_rel = theta_rel
+        self.last_action = action.copy()
 
         return obs, reward, terminated, truncated, info
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.last_action = np.zeros(2)
+        self.last_e_fm = obs[0]
+        self.last_theta_rel = obs[1]
         return obs, info
 
 
@@ -366,7 +364,7 @@ class TrainingVisualizer:
 
     def _plot(self, episode):
         self.axes[0, 0].clear()
-        self.axes[0, 0].plot(self.episode_rewards)
+        self.axes[0, 0].plot(self.episode_rewards, alpha=0.5)
         self.axes[0, 0].set_title('Episode Reward')
         self.axes[0, 0].set_xlabel('Episode')
         self.axes[0, 0].set_ylabel('Reward')
@@ -420,12 +418,16 @@ class TrainingVisualizer:
         plt.close(self.fig)
 
 
-# ========== 评估函数 ==========
+# ========== 评估函数（修正版） ==========
 def evaluate_agent(agent, env, num_episodes=10, render=False):
     """评估训练好的智能体"""
     success_count = 0
     total_rewards = []
     episode_lengths = []
+
+    # 获取环境的成功阈值
+    e_fm_limit = env.env.e_fm_limit  # 0.1
+    theta_limit = env.env.theta_limit  # 12度
 
     for episode in range(num_episodes):
         state, _ = env.reset()
@@ -444,17 +446,25 @@ def evaluate_agent(agent, env, num_episodes=10, render=False):
             if render and episode == num_episodes - 1:
                 env.render()
 
-        # 判断是否成功
-        y_fm = env.env.y_fm if hasattr(env, 'env') else env.y_fm
-        success = y_fm <= 0 and terminated
+        y_fm = env.env.y_fm
+        e_fm = env.env.x_fm - env.env.track_centerline(y_fm)
+        theta_rel = env.env.theta - env.env.track_angle(y_fm)
+
+        # 修正成功条件
+        success = (terminated and
+                   y_fm >= env.env.y_end and
+                   abs(e_fm) < e_fm_limit and
+                   abs(theta_rel) < theta_limit)
+
         if success:
             success_count += 1
 
         total_rewards.append(episode_reward)
         episode_lengths.append(step_count)
 
-        print(f"评估 Episode {episode + 1}: Reward={episode_reward:.1f}, "
-              f"Length={step_count}, Success={success}")
+        status = "✓ 成功" if success else "✗ 失败"
+        print(f"评估 Episode {episode + 1}: {status} | Reward={episode_reward:.1f}, "
+              f"Length={step_count}, y_fm={y_fm:.2f}, e_fm={e_fm:.3f}, theta={np.rad2deg(theta_rel):.1f}°")
 
     avg_reward = np.mean(total_rewards)
     avg_length = np.mean(episode_lengths)
@@ -474,9 +484,114 @@ def evaluate_agent(agent, env, num_episodes=10, render=False):
     }
 
 
+# ========== 课程学习阶段 ==========
+def curriculum_learning_phase(agent, env, config, visualizer, phase_name, num_episodes, easy_mode=False):
+    """课程学习阶段"""
+    print(f"\n{'=' * 60}")
+    print(f"开始课程学习阶段: {phase_name}")
+    print(f"简单模式: {easy_mode}")
+    print(f"Episode数: {num_episodes}")
+    print(f"{'=' * 60}")
+
+    env.env.easy_mode = easy_mode
+
+    best_reward = -np.inf
+    success_count = 0
+
+    # 获取环境的成功阈值
+    e_fm_limit = env.env.e_fm_limit  # 0.1
+    theta_limit = env.env.theta_limit  # 12度
+
+    # 添加精度统计
+    precision_stats = {
+        'avg_e_fm': [],
+        'avg_theta_rel': [],
+        'perfect_count': 0,
+        'good_count': 0
+    }
+
+    for episode in range(1, num_episodes + 1):
+        state, _ = env.reset()
+        episode_reward = 0
+        episode_length = 0
+        terminated = False
+        truncated = False
+
+        while not (terminated or truncated):
+            deterministic = episode < 100 and easy_mode
+            action = agent.select_action(state, deterministic=deterministic)
+
+            next_state, reward, terminated, truncated, _ = env.step(action)
+
+            agent.buffer.push(state, action, reward, next_state, terminated or truncated)
+
+            state = next_state
+            episode_reward += reward
+            episode_length += 1
+
+            if len(agent.buffer) > config['learning_starts']:
+                for _ in range(config['updates_per_step']):
+                    agent.update()
+
+        agent.episode_rewards.append(episode_reward)
+        agent.episode_lengths.append(episode_length)
+
+        # 获取最终状态
+        y_fm = env.env.y_fm
+        e_fm = env.env.x_fm - env.env.track_centerline(y_fm)
+        theta_rel = env.env.theta - env.env.track_angle(y_fm)
+
+        # 统计到达时的精度
+        if terminated:
+            precision_stats['avg_e_fm'].append(abs(e_fm))
+            precision_stats['avg_theta_rel'].append(abs(theta_rel))
+
+            if abs(e_fm) < 0.03 and abs(theta_rel) < 0.02:
+                precision_stats['perfect_count'] += 1
+            elif abs(e_fm) < 0.05 and abs(theta_rel) < 0.05:
+                precision_stats['good_count'] += 1
+
+        # 成功条件：到达终点(y>=3.55) 且 偏差<0.1m 且 偏角<12度
+        success = (terminated and
+                   y_fm >= env.env.y_end and
+                   abs(e_fm) < e_fm_limit and
+                   abs(theta_rel) < theta_limit)
+
+        if success:
+            success_count += 1
+            print(f"🎉 Episode {episode} 成功入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°")
+
+        visualizer.update(episode, episode_reward, episode_length, success)
+
+        if episode_reward > best_reward:
+            best_reward = episode_reward
+            agent.save_model(f"{config['save_dir']}/{phase_name}_best_model.pt")
+
+        if episode % config['log_interval'] == 0:
+            recent_rewards = agent.episode_rewards[-100:] if len(
+                agent.episode_rewards) >= 100 else agent.episode_rewards
+            recent_success_rate = success_count / episode if episode > 0 else 0
+            print(f"Phase {phase_name} Episode {episode}/{num_episodes} | "
+                  f"Reward: {episode_reward:.1f} | "
+                  f"Avg Reward: {np.mean(recent_rewards):.1f} | "
+                  f"Success Rate: {recent_success_rate:.2%} | "
+                  f"Alpha: {agent.alpha.item():.3f} | "
+                  f"Buffer: {len(agent.buffer)}")
+
+        # 定期打印精度统计
+        if episode % 50 == 0:
+            if precision_stats['avg_e_fm']:
+                avg_e = np.mean(precision_stats['avg_e_fm'][-50:])
+                avg_theta = np.rad2deg(np.mean(precision_stats['avg_theta_rel'][-50:]))
+                print(f"📊 最近50次到达 - 平均偏差: {avg_e:.3f}m, 平均偏角: {avg_theta:.1f}°, "
+                      f"完美: {precision_stats['perfect_count']}, 优秀: {precision_stats['good_count']}")
+
+    return success_count / num_episodes
+
+
 # ========== 主训练函数 ==========
 def train_sac(config):
-    """SAC训练主函数"""
+    """SAC训练主函数（带课程学习）"""
 
     # 创建环境
     base_env = HelicopterInboundKinematicsEnv(render_mode=None)
@@ -491,89 +606,36 @@ def train_sac(config):
     # 可视化器
     visualizer = TrainingVisualizer(save_dir=config['save_dir'])
 
-    # 训练记录
-    best_reward = -np.inf
     training_start_time = time.time()
 
     print("=" * 60)
     print("开始训练 SAC (Soft Actor-Critic) 算法")
     print(f"状态维度: {state_dim}")
     print(f"动作维度: {action_dim}")
+    print(f"动作空间: vx∈[-1,1], vy∈[0.02,0.1]")
     print(f"设备: {agent.device}")
     print(f"保存目录: {config['save_dir']}")
     print("=" * 60)
 
-    total_steps = 0
+    # 课程学习阶段1：简单模式（靠近机库）
+    phase1_success = curriculum_learning_phase(
+        agent, env, config, visualizer,
+        phase_name="phase1_easy",
+        num_episodes=config['curriculum_episodes_1'],
+        easy_mode=True
+    )
 
-    for episode in range(1, config['max_episodes'] + 1):
-        state, _ = env.reset()
-        episode_reward = 0
-        episode_length = 0
-        terminated = False
-        truncated = False
+    print(f"\n阶段1完成，成功率: {phase1_success:.2%}")
 
-        # 收集轨迹
-        while not (terminated or truncated):
-            # 选择动作
-            action = agent.select_action(state, deterministic=False)
+    # 课程学习阶段2：正常模式（从起点开始）
+    phase2_success = curriculum_learning_phase(
+        agent, env, config, visualizer,
+        phase_name="phase2_normal",
+        num_episodes=config['curriculum_episodes_2'],
+        easy_mode=False
+    )
 
-            # 执行动作
-            next_state, reward, terminated, truncated, _ = env.step(action)
-
-            # 存储经验
-            agent.buffer.push(state, action, reward, next_state, terminated or truncated)
-
-            state = next_state
-            episode_reward += reward
-            episode_length += 1
-            total_steps += 1
-
-            # 更新网络
-            if total_steps > config['learning_starts']:
-                for _ in range(config['updates_per_step']):
-                    agent.update()
-
-        # 记录episode统计
-        agent.episode_rewards.append(episode_reward)
-        agent.episode_lengths.append(episode_length)
-
-        # 判断是否成功
-        y_fm = env.env.y_fm if hasattr(env, 'env') else env.y_fm
-        success = y_fm <= 0 and terminated
-
-        visualizer.update(episode, episode_reward, episode_length, success)
-
-        # 保存最佳模型
-        if episode_reward > best_reward:
-            best_reward = episode_reward
-            agent.save_model(f"{config['save_dir']}/best_model.pt")
-
-        # 定期打印
-        if episode % config['log_interval'] == 0:
-            recent_rewards = agent.episode_rewards[-100:] if len(
-                agent.episode_rewards) >= 100 else agent.episode_rewards
-            recent_lengths = agent.episode_lengths[-100:] if len(
-                agent.episode_lengths) >= 100 else agent.episode_lengths
-            avg_reward = np.mean(recent_rewards) if len(recent_rewards) > 0 else 0
-            avg_length = np.mean(recent_lengths) if len(recent_lengths) > 0 else 0
-            elapsed_time = time.time() - training_start_time
-
-            print(f"Episode {episode}/{config['max_episodes']} | "
-                  f"Reward: {episode_reward:.1f} | "
-                  f"Avg Reward (100): {avg_reward:.1f} | "
-                  f"Avg Length: {avg_length:.1f} | "
-                  f"Success: {success} | "
-                  f"Alpha: {agent.alpha.item():.3f} | "
-                  f"Buffer: {len(agent.buffer)} | "
-                  f"Time: {elapsed_time / 60:.1f} min")
-
-        # 定期评估
-        if episode % config['eval_interval'] == 0:
-            print("\n" + "-" * 40)
-            print("开始评估...")
-            eval_results = evaluate_agent(agent, env, num_episodes=10, render=False)
-            print(f"评估结果: 成功率={eval_results['success_rate']:.2%}")
-            print("-" * 40 + "\n")
+    print(f"\n阶段2完成，成功率: {phase2_success:.2%}")
 
     # 训练结束
     training_time = time.time() - training_start_time
@@ -615,30 +677,36 @@ def train_sac(config):
 # ========== 主程序 ==========
 if __name__ == "__main__":
 
-    # SAC训练配置
+    # SAC训练配置（修正版）
     config = {
         # SAC超参数
-        'gamma': 0.99,  # 折扣因子
-        'tau': 0.005,  # 目标网络软更新参数
-        'alpha_lr': 3e-4,  # 温度系数学习率
+        'gamma': 0.99,
+        'tau': 0.005,
+        'alpha_lr': 2e-4,
 
         # 网络参数
-        'hidden_dim': 256,  # 隐藏层维度
-        'actor_lr': 3e-4,  # Actor学习率
-        'critic_lr': 3e-4,  # Critic学习率
+        'hidden_dim': 128,
+
+        # 学习率
+        'actor_lr': 2e-4,
+        'critic_lr': 2e-4,
 
         # 训练参数
-        'max_episodes': 2500,  # 最大训练episode数
-        'batch_size': 256,  # 批量大小
-        'buffer_capacity': 700000,  # 经验池容量
-        'learning_starts': 10000,  # 开始学习前的步数
-        'updates_per_step': 1,  # 每步更新次数
+        'max_episodes': 2000,
+        'batch_size': 128,
+        'buffer_capacity': 200000,
+        'learning_starts': 2000,  # 减少预热
+        'updates_per_step': 1,
+
+        # 课程学习参数
+        'curriculum_episodes_1': 200,  # 简单模式400集
+        'curriculum_episodes_2': 800,  # 正常模式1600集
 
         # 其他
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'save_dir': f'SAC_training_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
-        'log_interval': 20,  # 打印间隔
-        'eval_interval': 100,  # 评估间隔
+        'save_dir': f'SAC_fixed_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
+        'log_interval':50,
+        'eval_interval': 200,
     }
 
     # 创建保存目录
@@ -649,7 +717,6 @@ if __name__ == "__main__":
 
     with open(f"{config['save_dir']}/config.json", 'w') as f:
         config_copy = config.copy()
-        # 转换非JSON可序列化的值
         config_copy['device'] = str(config_copy['device'])
         json.dump(config_copy, f, indent=4)
 

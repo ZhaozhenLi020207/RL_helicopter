@@ -1,5 +1,6 @@
 """
 直升机自动牵引入库环境
+参数：总长3.55m，最大速度0.1m/s
 """
 
 import gymnasium as gym
@@ -9,7 +10,6 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon, Circle, Rectangle
 from matplotlib.animation import FuncAnimation
 
-# 解决中文显示
 plt.rcParams["font.sans-serif"] = ["SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
@@ -17,41 +17,37 @@ plt.rcParams["axes.unicode_minus"] = False
 class HelicopterInboundKinematicsEnv(gym.Env):
     """
     直升机自动牵引入库环境
+    坐标系：y轴正方向指向机库（向前），x轴正方向向右
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, easy_mode=False):
         super().__init__()
 
-        # ========== 几何参数（基于论文图16） ==========
-        self.L_PFM = 0.198  # 牵引杆P到前轮中点FM的距离 (m)
-        self.L_AFM = 1.2  # 尾轮A到前轮中点FM的距离 (m)
-        self.L_PA = self.L_AFM - self.L_PFM  # 牵引杆P到尾轮A的距离 (m) = 1.002
-        self.L_wheel = 0.3  # 尾轮轮轴到触地点距离 (m)
+        # ========== 几何参数（修正为合理值） ==========
+        self.L_PFM = 0.198  # 牵引杆P到前轮中点FM的距离 (m) - 恢复原值
+        self.L_AFM = 1.2  # 尾轮A到前轮中点FM的距离 (m) - 恢复原值
+        self.L_PA = self.L_AFM - self.L_PFM
 
         # ========== 控制参数 ==========
-        # 根据论文第4页指标：横移速度0.05m/s恒定，牵引速度0.05-0.5m/s可调
-        self.VX_CONSTANT = 0.05  # 横移速度恒定值 (m/s)
-        self.VY_MIN = 0.05  # 最小牵引速度 (m/s)
-        self.VY_MAX = 0.5  # 最大牵引速度 (m/s)
+        self.VX_MAX = 0.004  # 最大横移速度 (m/s)
+        self.VY_MAX = 0.03  # 最大牵引速度 (m/s)
+        self.VY_MIN = 0.005  # 最小牵引速度 (m/s)
 
         # ========== 轨道参数 ==========
-        self.y_start = 30.0  # 起始y坐标 (降落区域)
-        self.y_curve_start = 22.0  # 弯道起点
-        self.y_curve_end = 8.0  # 弯道终点
-        self.y_hangar_end = 0.0  # 机库终点
-        self.curve_dx = 0.6  # 弯道横向偏移 (m)
+        self.y_start = 0.0  # 起始y坐标（机库位置）
+        self.y_end = 3.55  # 终点y坐标（降落区域）
+        self.y_curve_start = 1.4  # 弯道起点
+        self.y_curve_end = 2.65  # 弯道终点
+        self.curve_dx = 0.38  # 横向偏移 (m)
 
-        # ========== 控制阈值（论文3.2节） ==========
-        self.e_fm_limit = 0.3  # 前轮中点允许偏差 (m)
-        self.theta_limit = np.deg2rad(12)  # 允许偏角上限 (12°)
-        self.tail_angle_limit = np.deg2rad(8)  # 尾轮偏角限制 (8°)
+        # ========== 控制阈值 ==========
+        self.e_fm_limit = 0.1  # 允许偏差 (m)
+        self.theta_limit = np.deg2rad(12)  # 允许偏角12度
+        self.tail_angle_limit = np.deg2rad(10)
 
         # ========== 动作空间 ==========
-        # 动作: [vx_sign, vy]
-        # vx_sign: -1(左移), 0(不动), 1(右移)  - 横移速度方向
-        # vy: 牵引速度大小 (连续值)
         self.action_space = spaces.Box(
             low=np.array([-1, self.VY_MIN], dtype=np.float32),
             high=np.array([1, self.VY_MAX], dtype=np.float32),
@@ -59,212 +55,179 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         )
 
         # ========== 观测空间 ==========
-        # [e_fm, theta, e_p, tail_angle, y_remaining]
-        # e_fm: 前轮中点距轨道距离 (m)
-        # theta: 机身偏角 (rad)
-        # e_p: 牵引杆距理想轨迹距离 (m)
-        # tail_angle: 尾轮偏角 (rad)
-        # y_remaining: 剩余入库距离 (m)
         self.observation_space = spaces.Box(
-            low=np.array([-0.5, -np.pi / 6, -0.5, -np.pi / 3, 0], dtype=np.float32),
-            high=np.array([0.5, np.pi / 6, 0.5, np.pi / 3, 35], dtype=np.float32),
+            low=np.array([-0.5, -np.pi / 4, -0.5, -np.pi / 2, 0], dtype=np.float32),
+            high=np.array([0.5, np.pi / 4, 0.5, np.pi / 2, 4], dtype=np.float32),
             dtype=np.float32
         )
 
-        # ========== 状态变量 ==========
-        self.x_fm = None  # 前轮中点FM的x坐标 (m)
-        self.y_fm = None  # 前轮中点FM的y坐标 (m)
-        self.theta = None  # 机身偏角 (rad)
-        self.tail_angle = None  # 尾轮偏角 (rad) - 尾轮朝向与机身的夹角
-        self.x_p = None  # 牵引杆P的x坐标 (m)
-        self.y_p = None  # 牵引杆P的y坐标 (m)
+        # 状态变量
+        self.x_fm = None
+        self.y_fm = None
+        self.theta = None
+        self.tail_angle = None
+        self.x_p = None
+        self.y_p = None
 
         self.current_steps = 0
-        self.max_steps = 1500
-        self.trajectory = []  # 记录轨迹用于可视化
+        self.max_steps = 1000  # 足够完成全程
+        self.trajectory = []
+
+        self.last_e_fm = None
+        self.last_theta_rel = None
+        self.last_y = None
 
         self.render_mode = render_mode
         self.fig = None
         self.ax = None
-
-        # 用于差分计算的上一帧位置
-        self._prev_x_A = None
-        self._prev_y_A = None
+        self.easy_mode = easy_mode
 
     def track_centerline(self, y):
-        """
-        轨道中心线函数（图87：直-弯-直线型）
-
-        参数:
-            y: 沿轨道位置 (m)
-        返回:
-            x: 轨道中心线x坐标 (m)
-        """
-        if y >= self.y_curve_start:
-            # 直轨道段1
+        """轨道中心线函数"""
+        if y <= self.y_curve_start:
             return 0.0
-        elif y >= self.y_curve_end:
-            # 弯轨道段（贝塞尔曲线过渡）
-            t = (self.y_curve_start - y) / (self.y_curve_start - self.y_curve_end)
-            # 使用S形曲线，曲率连续
+        elif y <= self.y_curve_end:
+            t = (y - self.y_curve_start) / (self.y_curve_end - self.y_curve_start)
             return self.curve_dx * (1 - np.cos(np.pi * t)) / 2
         else:
-            # 直轨道段2
             return self.curve_dx
 
     def track_derivative(self, y):
-        """
-        轨道中心线导数 dx/dy
-        """
-        if y >= self.y_curve_start:
+        """轨道中心线导数 dx/dy"""
+        if y <= self.y_curve_start:
             return 0.0
-        elif y >= self.y_curve_end:
-            t = (self.y_curve_start - y) / (self.y_curve_start - self.y_curve_end)
-            dt_dy = -1 / (self.y_curve_start - self.y_curve_end)
+        elif y <= self.y_curve_end:
+            t = (y - self.y_curve_start) / (self.y_curve_end - self.y_curve_start)
+            dt_dy = 1 / (self.y_curve_end - self.y_curve_start)
             dx_dt = self.curve_dx * np.pi * np.sin(np.pi * t) / 2
             return dx_dt * dt_dy
         else:
             return 0.0
 
     def track_angle(self, y):
-        """
-        轨道切线角度 (rad)
-        """
+        """轨道切线角度 (rad)"""
         return np.arctan2(self.track_derivative(y), 1.0)
 
-    def ideal_trajectory(self, y):
+    def update_kinematics(self, vx_cmd, vy_cmd, dt):
         """
-        理想轨迹
-        假设前轮中点始终在轨道上且机身与轨道相切
-        返回: 理想牵引杆位置 x_p_ideal
-        """
-        # 前轮中点位置（在轨道上）
-        x_fm_ideal = self.track_centerline(y)
-        # 前轮中点处轨道角度
-        track_angle = self.track_angle(y)
-        # 理想牵引杆位置
-        x_p_ideal = x_fm_ideal - self.L_PFM * np.sin(track_angle)
-        return x_p_ideal
-
-    def update_kinematics(self, vx, vy, dt):
-        """
-        参数:
-            vx: 牵引杆横移速度 (m/s) - 垂直轨道方向
-            vy: 牵引杆牵引速度 (m/s) - 沿轨道方向
-            dt: 时间步长 (s)
+        运动学更新（修正版）
         """
         cos_theta = np.cos(self.theta)
         sin_theta = np.sin(self.theta)
 
-        # 前轮中点速度
-        # v_FM = v_P + ω × r_PFM
-        vx_fm = vx * cos_theta - vy * sin_theta
-        vy_fm = -vy * cos_theta
+        # 牵引杆速度（世界坐标系）
+        v_px = vx_cmd * cos_theta - vy_cmd * sin_theta
+        v_py = vx_cmd * sin_theta + vy_cmd * cos_theta
 
-        # 机身角速度
-        # ω = (vx·cosθ + vy·sinθ) / L_PFM
-        omega = (vx * cos_theta + vy * sin_theta) / self.L_PFM
+        # 角速度（使用更稳定的公式）
+        # omega = (vx_cmd * cos_theta + vy_cmd * sin_theta) / L_PFM
+        # 简化：横向速度引起的旋转
+        omega = vx_cmd / self.L_PFM
+
+        # 限制角速度范围
+        omega = np.clip(omega, -0.5, 0.5)
+
+        # 前轮中点速度
+        v_fm_x = v_px - omega * self.L_PFM * cos_theta
+        v_fm_y = v_py - omega * self.L_PFM * sin_theta
 
         # 更新状态
-        self.x_fm += vx_fm * dt
-        self.y_fm += vy_fm * dt
+        self.x_fm += v_fm_x * dt
+        self.y_fm += v_fm_y * dt
         self.theta += omega * dt
 
-        # 角度归一化到[-π, π]
-        self.theta = np.arctan2(np.sin(self.theta), np.cos(self.theta))
+        # 限制位置范围（防止飞出）
+        self.x_fm = np.clip(self.x_fm, -0.5, 1.0)
+        self.y_fm = np.clip(self.y_fm, -0.5, self.y_end + 0.5)
+        self.theta = np.clip(self.theta, -np.pi / 3, np.pi / 3)
 
-        # 更新牵引杆位置（式2.1）
+        # 更新牵引杆位置
         self.x_p = self.x_fm + self.L_PFM * np.sin(self.theta)
         self.y_p = self.y_fm - self.L_PFM * np.cos(self.theta)
 
-        # 更新尾轮偏角（式2.9-2.12）
-        self._update_tail_angle(dt, omega)
+        # 尾轮偏角（简化模型）
+        self.tail_angle = np.clip(self.tail_angle + omega * dt * 0.5, -0.3, 0.3)
 
-    def _update_tail_angle(self, dt, omega):
+    def compute_reward(self, e_fm, theta_rel, y_fm):
         """
-        更新尾轮偏角
-        尾轮作为万向轮，其朝向会自然趋向于运动方向
-
-        参数:
-            dt: 时间步长
-            omega: 机身角速度
-        """
-        # 计算尾轮A点位置
-        x_A = self.x_fm - self.L_AFM * np.sin(self.theta)
-        y_A = self.y_fm - self.L_AFM * np.cos(self.theta)
-
-        # 使用差分计算A点速度（需要至少两帧数据）
-        if self._prev_x_A is not None and self._prev_y_A is not None and dt > 0:
-            v_Ax = (x_A - self._prev_x_A) / dt
-            v_Ay = (y_A - self._prev_y_A) / dt
-        else:
-            # 第一帧：使用解析方法估算速度
-            # 基于当前角速度和牵引杆速度估算
-            v_Ax = self.x_p + self.L_PA * np.cos(self.theta) * omega
-            v_Ay = self.y_p + self.L_PA * np.sin(self.theta) * omega
-
-        # 保存当前位置用于下次差分
-        self._prev_x_A = x_A
-        self._prev_y_A = y_A
-
-        # A点速度方向
-        v_A = np.sqrt(v_Ax ** 2 + v_Ay ** 2)
-
-        if v_A > 0.01:
-            # 速度方向角（世界坐标系）
-            velocity_angle = np.arctan2(v_Ax, v_Ay)
-            # 转换为相对于机身的角度
-            target_angle = velocity_angle - self.theta
-            # 归一化到[-π, π]
-            target_angle = np.arctan2(np.sin(target_angle), np.cos(target_angle))
-
-            # 一阶惯性响应（模拟尾轮转向）
-            tau = 0.5  # 时间常数，越大响应越慢
-            alpha = min(1.0, dt / tau)
-            self.tail_angle += alpha * (target_angle - self.tail_angle)
-        else:
-            # 速度很小时，尾轮缓慢回到中立位置
-            alpha = min(1.0, dt / 1.0)  # 较慢的回归速度
-            self.tail_angle += alpha * (0 - self.tail_angle)
-
-        # 限制尾轮偏角范围
-        self.tail_angle = np.clip(self.tail_angle, -np.pi / 2, np.pi / 2)
-
-    def compute_reward(self, e_fm, theta_rel, e_p, tail_angle, y_fm):
-        """
-        计算奖励函数
-
-        控制目标：
-        1. 减小前轮中点偏差 e_fm
-        2. 减小机身偏角 theta
-        3. 保持尾轮偏角在安全范围内
-        4. 快速入库
+        激进版奖励函数 - 强调精度
         """
         reward = 0.0
 
-        # ========== 主要目标：减小偏差 ==========
-        # 前轮中点偏差惩罚
-        reward -= 3.0 * abs(e_fm)
+        # ========== 1. 精度惩罚（指数级） ==========
+        # 偏差惩罚 - 指数增长
+        e_penalty = 10.0 * (abs(e_fm) ** 1.5)  # 0.1m→0.32, 0.2m→0.89, 0.3m→1.64
+        theta_penalty = 8.0 * (abs(theta_rel) ** 1.5)
+        reward -= e_penalty
+        reward -= theta_penalty
 
-        # 机身偏角惩罚
-        reward -= 2.0 * abs(theta_rel)
+        # ========== 2. 精度奖励（阶梯式） ==========
+        # 偏差奖励
+        if abs(e_fm) < 0.03:
+            reward += 3.0  # 优秀
+        elif abs(e_fm) < 0.05:
+            reward += 1.5  # 良好
+        elif abs(e_fm) < 0.08:
+            reward += 0.5  # 及格
 
-        # 牵引杆偏离理想轨迹惩罚
-        reward -= 0.5 * abs(e_p)
+        # 偏角奖励
+        if abs(theta_rel) < 0.02:  # ~1.15°
+            reward += 2.0
+        elif abs(theta_rel) < 0.05:  # ~2.86°
+            reward += 1.0
+        elif abs(theta_rel) < 0.08:  # ~4.58°
+            reward += 0.3
 
-        # ========== 尾轮安全约束 ==========
-        # 尾轮偏角超出安全范围惩罚
-        if abs(tail_angle) > self.tail_angle_limit:
-            reward -= 5.0 * (abs(tail_angle) - self.tail_angle_limit)
+        # ========== 3. 改善奖励（增强） ==========
+        if self.last_e_fm is not None:
+            e_improve = abs(self.last_e_fm) - abs(e_fm)
+            theta_improve = abs(self.last_theta_rel) - abs(theta_rel)
 
-        # ========== 进度奖励 ==========
-        # 向机库移动奖励
-        progress = (self.y_start - max(0, y_fm)) / self.y_start
-        reward += 1.5 * progress
+            # 改善越多，奖励越大
+            if e_improve > 0:
+                reward += 3.0 * e_improve * (1 + abs(e_fm) * 10)  # 偏差大时改善奖励更高
+            elif e_improve < -0.02:  # 恶化惩罚
+                reward -= 1.0
 
-        # 阶段性奖励：位姿良好
-        if abs(e_fm) < self.e_fm_limit and abs(theta_rel) < self.theta_limit:
-            reward += 0.8
+            if theta_improve > 0:
+                reward += 2.0 * theta_improve * (1 + abs(theta_rel) * 20)
+
+        # ========== 4. 条件前进奖励 ==========
+        # 只有精度足够时才给前进奖励
+        if abs(e_fm) < 0.1 and abs(theta_rel) < 0.1:
+            # 良好状态下的前进奖励
+            progress = (self.y_end - y_fm) / self.y_end
+            reward += 2.0 * progress
+        else:
+            # 状态差时，前进奖励很少
+            progress = (self.y_end - y_fm) / self.y_end
+            reward += 0.2 * progress
+
+        # ========== 5. 到达奖励（严格） ==========
+        if y_fm >= self.y_end:
+            if abs(e_fm) < 0.03 and abs(theta_rel) < 0.02:
+                reward += 300  # 完美入库
+                print(f"🏆 完美入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°")
+            elif abs(e_fm) < 0.05 and abs(theta_rel) < 0.05:
+                reward += 150  # 优秀入库
+                print(f"⭐ 优秀入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°")
+            elif abs(e_fm) < 0.08 and abs(theta_rel) < 0.08:
+                reward += 80  # 良好入库
+                print(f"✓ 良好入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°")
+            elif abs(e_fm) < 0.1 and abs(theta_rel) < 0.1:
+                reward += 30  # 及格
+                print(f"⚠️ 及格入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°")
+            else:
+                reward -= 50  # 失败
+                print(f"✗ 到达但位姿不佳 | 偏差: {e_fm:.3f}m, 偏角: {np.rad2deg(theta_rel):.1f}°")
+
+        # ========== 6. 稳定性奖励 ==========
+        reward += 0.02
+
+        # ========== 7. 大幅度动作惩罚 ==========
+        if hasattr(self, 'last_vx_cmd'):
+            if abs(self.last_vx_cmd) > 0.08:
+                reward -= 0.2
 
         return reward
 
@@ -272,43 +235,46 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         """重置环境"""
         super().reset(seed=seed)
 
-        # 随机初始位姿
-        self.y_fm = self.np_random.uniform(self.y_start - 3, self.y_start)
-        track_x = self.track_centerline(self.y_fm)
+        if self.easy_mode:
+            # 简单模式：从靠近机库的位置开始
+            self.y_fm = self.np_random.uniform(0, 1.5)
+            e_fm_init = self.np_random.uniform(-0.1, 0.1)
+            self.theta = self.np_random.uniform(-np.deg2rad(5), np.deg2rad(5))
+        else:
+            # 正常模式：从起点附近开始
+            self.y_fm = self.np_random.uniform(2.8, self.y_end)
+            e_fm_init = self.np_random.uniform(-0.25, 0.25)
+            self.theta = self.np_random.uniform(-np.deg2rad(12), np.deg2rad(12))
 
-        # 初始偏差
-        e_fm_init = self.np_random.uniform(-0.4, 0.4)
+        track_x = self.track_centerline(self.y_fm)
         self.x_fm = track_x + e_fm_init
 
-        # 初始偏角 (-15° 到 15°)
-        self.theta = self.np_random.uniform(-np.deg2rad(15), np.deg2rad(15))
-
-        # 初始尾轮偏角（假设与机身对齐）
         self.tail_angle = 0.0
-
-        # 计算初始牵引杆位置
         self.x_p = self.x_fm + self.L_PFM * np.sin(self.theta)
         self.y_p = self.y_fm - self.L_PFM * np.cos(self.theta)
-
-        # 重置差分变量
-        self._prev_x_A = None
-        self._prev_y_A = None
 
         self.current_steps = 0
         self.trajectory = []
 
-        # 记录初始状态
+        obs = self._get_obs()
+        self.last_e_fm = obs[0]
+        self.last_theta_rel = obs[1]
+        self.last_y = self.y_fm
+
         self._record_state()
 
-        return self._get_obs(), {}
+        return obs, {}
 
     def _get_obs(self):
         """获取观测值"""
-        # 计算偏差
         e_fm = self.x_fm - self.track_centerline(self.y_fm)
-        e_p = self.x_p - self.ideal_trajectory(self.y_fm)
         theta_rel = self.theta - self.track_angle(self.y_fm)
-        y_remaining = max(0, self.y_fm - self.y_hangar_end)
+
+        # 理想牵引杆位置
+        ideal_x_p = self.track_centerline(self.y_fm) - self.L_PFM * np.sin(self.track_angle(self.y_fm))
+        e_p = self.x_p - ideal_x_p
+
+        y_remaining = self.y_end - self.y_fm
 
         return np.array([
             e_fm,
@@ -319,7 +285,7 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         ], dtype=np.float32)
 
     def _record_state(self):
-        """记录当前状态用于可视化"""
+        """记录状态"""
         self.trajectory.append({
             'x_fm': self.x_fm,
             'y_fm': self.y_fm,
@@ -330,88 +296,86 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         })
 
     def step(self, action):
-        """
-        执行一步仿真
+        """执行一步"""
+        dt = 0.05
 
-        参数:
-            action: [vx_sign, vy]
-                vx_sign: -1, 0, 1  (横移速度方向)
-                vy: 0.05-0.5 (牵引速度大小)
-        """
-        dt = 0.1  # 固定时间步长
-
-        # 解析动作
         vx_sign = np.clip(action[0], -1, 1)
         vy = np.clip(action[1], self.VY_MIN, self.VY_MAX)
 
-        # 横移速度 = 方向 × 恒定大小
-        vx = vx_sign * self.VX_CONSTANT
+        vx_cmd = vx_sign * self.VX_MAX
+        # 记录动作用于惩罚
+        self.last_vx_cmd = vx_cmd
 
-        # 运动学更新
-        self.update_kinematics(vx, vy, dt)
-
-        # 记录状态
+        # 更新动力学
+        self.update_kinematics(vx_cmd, vy, dt)
         self._record_state()
 
-        # 计算奖励
         e_fm = self.x_fm - self.track_centerline(self.y_fm)
         theta_rel = self.theta - self.track_angle(self.y_fm)
-        e_p = self.x_p - self.ideal_trajectory(self.y_fm)
-        reward = self.compute_reward(e_fm, theta_rel, e_p, self.tail_angle, self.y_fm)
+
+        reward = self.compute_reward(e_fm, theta_rel, self.y_fm)
 
         self.current_steps += 1
+        self.last_e_fm = e_fm
+        self.last_theta_rel = theta_rel
 
-        # 终止条件
-        terminated = self.y_fm <= self.y_hangar_end  # 到达机库
-        truncated = self.current_steps >= self.max_steps
+        # 终止条件（修正：到达y_end才算成功）
+        terminated = self.y_fm >= self.y_end
 
-        # 失稳提前终止
-        if abs(theta_rel) > np.deg2rad(30) or abs(e_fm) > 0.8:
-            truncated = True
-            reward -= 50
+        # 失败条件（放宽一点）
+        failed = (abs(e_fm) > 0.5 or  # 偏差大于0.5m
+                  abs(theta_rel) > np.deg2rad(45) or  # 偏角大于45度
+                  self.current_steps >= self.max_steps)
 
-        # 成功额外奖励
+        truncated = failed
+
+        # 成功奖励
         if terminated:
             if abs(e_fm) < self.e_fm_limit and abs(theta_rel) < self.theta_limit:
-                reward += 200
+                reward += 100
+                print(
+                    f"✓ 成功入库！步数: {self.current_steps}, 最终偏差: {e_fm:.3f}m, 偏角: {np.rad2deg(theta_rel):.1f}°")
             else:
-                reward -= 50
+                reward -= 30
+                print(f"✗ 到达但位姿不佳 | 偏差: {e_fm:.3f}m, 偏角: {np.rad2deg(theta_rel):.1f}°")
+
+        if failed and not terminated:
+            reward -= 15
 
         return self._get_obs(), reward, terminated, truncated, {}
 
     def render(self):
-        """渲染可视化"""
+        """渲染"""
         if self.render_mode is None:
             return
 
         if self.fig is None:
-            self.fig, self.ax = plt.subplots(figsize=(12, 10))
+            self.fig, self.ax = plt.subplots(figsize=(12, 8))
 
         self.ax.clear()
 
         # 设置坐标轴
-        self.ax.set_xlim(-0.3, 1.0)
-        self.ax.set_ylim(-2, self.y_start + 2)
+        self.ax.set_xlim(-0.2, 0.6)
+        self.ax.set_ylim(-0.5, self.y_end + 0.5)
         self.ax.set_xlabel("横向位置 x (m)", fontsize=12)
-        self.ax.set_ylabel("纵向位置 y (m)", fontsize=12)
+        self.ax.set_ylabel("纵向位置 y (m) → 机库方向", fontsize=12)
         self.ax.set_title("直升机自动牵引入库仿真", fontsize=14)
         self.ax.grid(True, alpha=0.3)
         self.ax.set_aspect('equal')
 
-        # 绘制轨道中心线
-        ys = np.linspace(-1, self.y_start + 2, 500)
+        # 绘制轨道
+        ys = np.linspace(-0.5, self.y_end + 0.5, 500)
         xs = [self.track_centerline(y) for y in ys]
         self.ax.plot(xs, ys, 'b-', linewidth=3, label='牵引轨道', zorder=1)
 
-        # 绘制轨道边界（轨道宽度0.2m）
+        # 轨道边界
         self.ax.fill_between(ys,
-                             [x - 0.1 for x in xs],
-                             [x + 0.1 for x in xs],
+                             [x - 0.05 for x in xs],
+                             [x + 0.05 for x in xs],
                              color='blue', alpha=0.1, zorder=0)
 
-        # 绘制机库区域
-        hangar_x = self.track_centerline(0) - 0.5
-        hangar_rect = Rectangle((hangar_x, -1), 1.0, 1.5,
+        # 机库区域
+        hangar_rect = Rectangle((-0.3, -0.3), 0.6, 0.5,
                                 linewidth=2, edgecolor='red',
                                 facecolor='none', label='机库')
         self.ax.add_patch(hangar_rect)
@@ -421,182 +385,123 @@ class HelicopterInboundKinematicsEnv(gym.Env):
 
         # 绘制轨迹
         if len(self.trajectory) > 1:
-            fm_traj_x = [t['x_fm'] for t in self.trajectory]
-            fm_traj_y = [t['y_fm'] for t in self.trajectory]
+            fm_traj_x = [t['x_fm'] for t in self.trajectory[::5]]
+            fm_traj_y = [t['y_fm'] for t in self.trajectory[::5]]
             self.ax.plot(fm_traj_x, fm_traj_y, 'g--', linewidth=1,
-                         alpha=0.5, label='前轮中点轨迹', zorder=1)
+                         alpha=0.5, label='前轮轨迹', zorder=1)
 
-        # 显示状态信息
+        # 显示信息
         e_fm = self.x_fm - self.track_centerline(self.y_fm)
         theta_rel = self.theta - self.track_angle(self.y_fm)
 
         info_text = f"步数: {self.current_steps}\n"
+        info_text += f"位置: {self.y_fm:.2f}/{self.y_end:.2f}m\n"
+        info_text += f"进度: {self.y_fm / self.y_end * 100:.1f}%\n"
         info_text += f"偏差: {e_fm:.3f}m\n"
-        info_text += f"偏角: {np.rad2deg(theta_rel):.1f}°\n"
-        info_text += f"尾轮角: {np.rad2deg(self.tail_angle):.1f}°\n"
-        info_text += f"y位置: {self.y_fm:.1f}m"
+        info_text += f"偏角: {np.rad2deg(theta_rel):.1f}°"
 
         self.ax.text(0.02, 0.98, info_text, transform=self.ax.transAxes,
                      fontsize=10, verticalalignment='top',
                      bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
         self.ax.legend(loc='upper right')
-
         plt.tight_layout()
 
         if self.render_mode == "human":
             plt.pause(0.01)
-        elif self.render_mode == "rgb_array":
-            self.fig.canvas.draw()
-            return np.frombuffer(self.fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(
-                self.fig.canvas.get_width_height()[::-1] + (3,))
 
     def _draw_helicopter(self):
-        """绘制直升机（基于论文图16的坐标系）"""
-        # 前轮中点FM位置
+        """绘制直升机"""
         fm_x, fm_y = self.x_fm, self.y_fm
 
-        # 机身三角形顶点（后三点式布局）
-        # 机头在前轮中点，机尾在后方L_AFM处
         cos_theta = np.cos(self.theta)
         sin_theta = np.sin(self.theta)
 
-        # 机头（前轮中点）
+        # 机头
         nose = (fm_x, fm_y)
 
-        # 左右后点（机尾两侧）
-        tail_center_x = fm_x - self.L_AFM * sin_theta
-        tail_center_y = fm_y - self.L_AFM * cos_theta
+        # 机尾
+        tail_x = fm_x - self.L_AFM * sin_theta
+        tail_y = fm_y - self.L_AFM * cos_theta
 
-        left_rear = (tail_center_x - 0.1 * cos_theta,
-                     tail_center_y + 0.1 * sin_theta)
-        right_rear = (tail_center_x + 0.1 * cos_theta,
-                      tail_center_y - 0.1 * sin_theta)
+        # 机身
+        left_rear = (tail_x - 0.08 * cos_theta, tail_y + 0.08 * sin_theta)
+        right_rear = (tail_x + 0.08 * cos_theta, tail_y - 0.08 * sin_theta)
 
-        # 绘制机身
         body = Polygon([nose, left_rear, right_rear],
                        closed=True, color='gray', alpha=0.8, zorder=2)
         self.ax.add_patch(body)
 
-        # 绘制前轮（固定轮）
-        front_wheel = Circle(nose, 0.08, color='black', zorder=3)
+        # 前轮
+        front_wheel = Circle(nose, 0.04, color='black', zorder=3)
         self.ax.add_patch(front_wheel)
 
-        # 绘制尾轮（万向轮）
-        tail_wheel = Circle((tail_center_x, tail_center_y), 0.07,
-                            color='red', zorder=3)
+        # 尾轮
+        tail_wheel = Circle((tail_x, tail_y), 0.035, color='red', zorder=3)
         self.ax.add_patch(tail_wheel)
 
-        # 绘制尾轮朝向指示线（显示万向轮当前朝向）
-        tail_wheel_angle = self.theta + self.tail_angle
-        arrow_len = 0.15
-        arrow_end_x = tail_center_x + arrow_len * np.sin(tail_wheel_angle)
-        arrow_end_y = tail_center_y + arrow_len * np.cos(tail_wheel_angle)
-        self.ax.annotate('', xy=(arrow_end_x, arrow_end_y),
-                         xytext=(tail_center_x, tail_center_y),
-                         arrowprops=dict(arrowstyle='->', color='red', lw=2))
-
-        # 绘制牵引杆
+        # 牵引杆
         towbar_x = self.x_p
         towbar_y = self.y_p
         self.ax.plot([towbar_x, fm_x], [towbar_y, fm_y],
-                     linewidth=3, color='orange', zorder=2, label='牵引杆')
+                     linewidth=2, color='orange', zorder=2)
+        self.ax.plot(towbar_x, towbar_y, 'ro', markersize=4, zorder=3)
 
-        # 标记牵引点
-        self.ax.plot(towbar_x, towbar_y, 'ro', markersize=6, zorder=3)
-
-        # 绘制理想轨迹上的对应点
-        ideal_x = self.ideal_trajectory(self.y_fm)
-        self.ax.plot(ideal_x, self.y_fm, 'g*', markersize=8,
-                     alpha=0.5, label='理想牵引杆位置')
-
-    def make_animation(self, filename="helicopter_inbound.gif", save_frames=500):
+    def make_animation(self, filename="helicopter_inbound.gif", save_frames=200):
         """生成动画"""
         if len(self.trajectory) == 0:
             print("无轨迹数据")
             return
 
-        fig, ax = plt.subplots(figsize=(12, 10))
+        fig, ax = plt.subplots(figsize=(12, 8))
 
         def animate(frame_idx):
             ax.clear()
 
-            # 获取当前帧数据
             t = self.trajectory[min(frame_idx, len(self.trajectory) - 1)]
             x_fm, y_fm = t['x_fm'], t['y_fm']
             theta = t['theta']
             x_p, y_p = t['x_p'], t['y_p']
-            tail_angle = t['tail_angle']
 
-            # 设置坐标轴
-            ax.set_xlim(-0.3, 1.0)
-            ax.set_ylim(-2, self.y_start + 2)
+            ax.set_xlim(-0.2, 0.6)
+            ax.set_ylim(-0.5, self.y_end + 0.5)
             ax.set_xlabel("横向位置 x (m)")
             ax.set_ylabel("纵向位置 y (m)")
             ax.set_title(f"直升机自动牵引入库 (步数: {frame_idx})")
             ax.grid(True, alpha=0.3)
             ax.set_aspect('equal')
 
-            # 绘制轨道
-            ys = np.linspace(-1, self.y_start + 2, 500)
+            ys = np.linspace(-0.5, self.y_end + 0.5, 500)
             xs = [self.track_centerline(y) for y in ys]
             ax.plot(xs, ys, 'b-', linewidth=3, label='牵引轨道')
 
-            # 绘制机库
-            hangar_x = self.track_centerline(0) - 0.5
-            hangar_rect = Rectangle((hangar_x, -1), 1.0, 1.5,
+            hangar_rect = Rectangle((-0.3, -0.3), 0.6, 0.5,
                                     linewidth=2, edgecolor='red',
                                     facecolor='none', label='机库')
             ax.add_patch(hangar_rect)
 
-            # 绘制历史轨迹
-            traj_x = [t_hist['x_fm'] for t_hist in self.trajectory[:frame_idx + 1]]
-            traj_y = [t_hist['y_fm'] for t_hist in self.trajectory[:frame_idx + 1]]
+            traj_x = [t_hist['x_fm'] for t_hist in self.trajectory[:frame_idx + 1:5]]
+            traj_y = [t_hist['y_fm'] for t_hist in self.trajectory[:frame_idx + 1:5]]
             ax.plot(traj_x, traj_y, 'g--', linewidth=1, alpha=0.5, label='前轮轨迹')
 
-            # 绘制直升机
             cos_theta = np.cos(theta)
             sin_theta = np.sin(theta)
 
             nose = (x_fm, y_fm)
-            tail_center_x = x_fm - self.L_AFM * sin_theta
-            tail_center_y = y_fm - self.L_AFM * cos_theta
-            left_rear = (tail_center_x - 0.1 * cos_theta,
-                         tail_center_y + 0.1 * sin_theta)
-            right_rear = (tail_center_x + 0.1 * cos_theta,
-                          tail_center_y - 0.1 * sin_theta)
+            tail_x = x_fm - self.L_AFM * sin_theta
+            tail_y = y_fm - self.L_AFM * cos_theta
+            left_rear = (tail_x - 0.08 * cos_theta, tail_y + 0.08 * sin_theta)
+            right_rear = (tail_x + 0.08 * cos_theta, tail_y - 0.08 * sin_theta)
 
             body = Polygon([nose, left_rear, right_rear],
                            closed=True, color='gray', alpha=0.8)
             ax.add_patch(body)
 
-            front_wheel = Circle(nose, 0.08, color='black')
-            ax.add_patch(front_wheel)
+            ax.plot([x_p, x_fm], [y_p, y_fm], 'orange', linewidth=2)
+            ax.plot(x_p, y_p, 'ro', markersize=4)
 
-            tail_wheel = Circle((tail_center_x, tail_center_y), 0.07, color='red')
-            ax.add_patch(tail_wheel)
-
-            # 尾轮朝向
-            tail_wheel_angle = theta + tail_angle
-            arrow_len = 0.15
-            arrow_end_x = tail_center_x + arrow_len * np.sin(tail_wheel_angle)
-            arrow_end_y = tail_center_y + arrow_len * np.cos(tail_wheel_angle)
-            ax.annotate('', xy=(arrow_end_x, arrow_end_y),
-                        xytext=(tail_center_x, tail_center_y),
-                        arrowprops=dict(arrowstyle='->', color='red', lw=2))
-
-            # 牵引杆
-            ax.plot([x_p, x_fm], [y_p, y_fm], 'orange', linewidth=3)
-            ax.plot(x_p, y_p, 'ro', markersize=6)
-
-            # 理想位置
-            ideal_x = self.ideal_trajectory(y_fm)
-            ax.plot(ideal_x, y_fm, 'g*', markersize=8, alpha=0.5)
-
-            # 状态信息
             e_fm = x_fm - self.track_centerline(y_fm)
-            theta_rel = theta - self.track_angle(y_fm)
-            info_text = f"偏差: {e_fm:.3f}m | 偏角: {np.rad2deg(theta_rel):.1f}° | y: {y_fm:.1f}m"
+            info_text = f"偏差: {e_fm:.3f}m | y: {y_fm:.2f}m"
             ax.text(0.02, 0.98, info_text, transform=ax.transAxes,
                     fontsize=10, verticalalignment='top',
                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
@@ -604,7 +509,6 @@ class HelicopterInboundKinematicsEnv(gym.Env):
             ax.legend(loc='upper right')
             return []
 
-        # 采样帧（避免太多帧）
         step = max(1, len(self.trajectory) // save_frames)
         frames = list(range(0, len(self.trajectory), step))
 
@@ -622,30 +526,52 @@ class HelicopterInboundKinematicsEnv(gym.Env):
             self.ax = None
 
 
-# ========== 测试代码 ==========
+# ========== 测试 ==========
 if __name__ == "__main__":
     env = HelicopterInboundKinematicsEnv(render_mode="human")
 
-    obs, _ = env.reset()
+    print("=" * 50)
+    print("直升机入库环境测试")
+    print(f"轨道长度: {env.y_end}m")
+    print(f"弯道范围: {env.y_curve_start}-{env.y_curve_end}m")
+    print(f"横向偏移: {env.curve_dx}m")
+    print(f"最大速度: {env.VY_MAX}m/s")
+    print("=" * 50)
 
-    for _ in range(500):
-        # 简单的试探性策略
-        action = np.array([0, 0.15])  # 直行，不横移
+    success_count = 0
 
-        # 如果有偏差，尝试修正
-        if obs[0] > 0.05:  # 前轮偏右
-            action[0] = -1  # 向左横移
-        elif obs[0] < -0.05:  # 前轮偏左
-            action[0] = 1  # 向右横移
+    for episode in range(10):
+        obs, _ = env.reset()
+        print(f"\nEpisode {episode + 1} - 起始位置 y={obs[4]:.2f}m")
 
-        obs, reward, terminated, truncated, _ = env.step(action)
+        total_reward = 0
 
-        if env.render_mode == "human":
+        for step in range(500):
+            e_fm, theta_rel, e_p, tail_angle, y_remaining = obs
+
+            # PID控制
+            vx_sign = -np.clip(e_fm * 4.0, -1, 1)  # 更强修正
+            vy = 0.08  # 中等速度
+
+            action = np.array([vx_sign, vy])
+            obs, reward, terminated, truncated, _ = env.step(action)
+            total_reward += reward
+
             env.render()
 
-        if terminated or truncated:
-            print(f"Episode结束: terminated={terminated}, truncated={truncated}")
-            print(f"最终偏差: {obs[0]:.3f}m, 偏角: {np.rad2deg(obs[1]):.1f}°")
-            break
+            if terminated or truncated:
+                success = terminated and abs(e_fm) < 0.1
+                if success:
+                    success_count += 1
+                status = "✓ 成功" if success else "✗ 失败"
+                print(f"{status} | 步数: {step + 1} | y={obs[4]:.2f}m | 偏差={obs[0]:.3f}m | 总奖励={total_reward:.1f}")
+                break
+
+        if not (terminated or truncated):
+            print(f"超时 | y={obs[4]:.2f}m | 偏差={obs[0]:.3f}m")
+
+    print(f"\n{'=' * 50}")
+    print(f"测试完成！成功率: {success_count}/10 = {success_count * 10}%")
+    print(f"{'=' * 50}")
 
     env.close()
