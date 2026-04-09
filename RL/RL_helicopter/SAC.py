@@ -1,6 +1,6 @@
 """
-基于SAC (Soft Actor-Critic)算法的直升机自动牵引入库训练（修正版）
-主要修正：坐标系统一、成功条件修正、动作空间匹配
+基于SAC (Soft Actor-Critic)算法的直升机自动牵引入库训练
+运动方向：从降落区域（y=3.55）向机库（y=0）运动
 """
 
 import gymnasium as gym
@@ -22,7 +22,7 @@ from helicopter_env import HelicopterInboundKinematicsEnv
 class SoftQNetwork(nn.Module):
     """Soft Q网络（Critic）"""
 
-    def __init__(self, state_dim, action_dim, hidden_dim=128):
+    def __init__(self, state_dim, action_dim, hidden_dim=64):
         super().__init__()
 
         self.net = nn.Sequential(
@@ -41,7 +41,7 @@ class SoftQNetwork(nn.Module):
 class GaussianPolicy(nn.Module):
     """高斯策略网络（Actor）"""
 
-    def __init__(self, state_dim, action_dim, hidden_dim=128, action_scale=1.0, action_bias=0.0):
+    def __init__(self, state_dim, action_dim, hidden_dim=64, action_scale=1.0, action_bias=0.0):
         super().__init__()
 
         self.action_scale = action_scale
@@ -150,9 +150,9 @@ class SACAgent:
         self.device = torch.device(config['device'])
 
         # 动作空间边界（匹配环境）
-        # 环境动作: [vx_sign (-1~1), vy (0.02~0.1)]
-        self.action_low = np.array([-1.0, 0.02], dtype=np.float32)
-        self.action_high = np.array([1.0, 0.1], dtype=np.float32)
+        # 环境: VY_MIN=0.005, VY_MAX=0.03
+        self.action_low = np.array([-1.0, 0.005], dtype=np.float32)
+        self.action_high = np.array([1.0, 0.03], dtype=np.float32)
         self.action_scale = torch.FloatTensor((self.action_high - self.action_low) / 2).to(self.device)
         self.action_bias = torch.FloatTensor((self.action_high + self.action_low) / 2).to(self.device)
 
@@ -203,14 +203,24 @@ class SACAgent:
         with torch.no_grad():
             action, _ = self.actor.sample(state, deterministic)
 
-        # 可选：添加小噪声增加探索（但保持精度）
-        if not deterministic and np.random.random() < 0.3:
-            noise = np.random.normal(0, 0.05, size=action.shape)
-            action = action.cpu().numpy()[0] + noise
-            action = np.clip(action, self.action_low, self.action_high)
-            return action
+        # 转换为numpy数组并确保是2维
+        action_np = action.cpu().numpy()[0]
 
-        return action.cpu().numpy()[0]
+        # 确保动作是2维数组
+        if action_np.shape == ():
+            action_np = np.array([float(action_np), 0.01])
+        elif len(action_np) == 1:
+            action_np = np.array([action_np[0], 0.01])
+        elif len(action_np) > 2:
+            action_np = action_np[:2]
+
+        # 添加噪声增加探索
+        if not deterministic and np.random.random() < 0.3:
+            noise = np.random.normal(0, 0.03, size=2)
+            action_np = action_np + noise
+            action_np = np.clip(action_np, self.action_low, self.action_high)
+
+        return action_np.astype(np.float32)
 
     def update(self):
         """更新网络参数"""
@@ -306,27 +316,39 @@ class SACAgent:
 
 # ========== 训练环境包装器 ==========
 class TrainingWrapper(gym.Wrapper):
-    """训练环境包装器（简化版）"""
+    """训练环境包装器"""
 
     def __init__(self, env, config):
         super().__init__(env)
         self.config = config
         self.last_action = np.zeros(2)
         self.last_e_fm = None
-        self.last_theta_rel = None
 
     def step(self, action):
+        # 确保动作格式正确
+        if isinstance(action, np.ndarray):
+            if action.shape == ():
+                action = np.array([float(action), 0.01])
+            elif len(action) == 1:
+                action = np.array([action[0], 0.01])
+            elif len(action) > 2:
+                action = action[:2]
+
         obs, reward, terminated, truncated, info = self.env.step(action)
         e_fm, theta_rel, e_p, tail_angle, y_remaining = obs
 
-        # 移除额外的奖励塑形，让环境自己的奖励函数起作用
-        # 只保留轻微的动作平滑奖励
+        # 动作平滑奖励
         action_change = np.abs(action - self.last_action).sum()
         if action_change < 0.05:
             reward += 0.01
 
+        # 偏差改善奖励
+        if self.last_e_fm is not None:
+            improvement = abs(self.last_e_fm) - abs(e_fm)
+            if improvement > 0:
+                reward += 0.5 * improvement
+
         self.last_e_fm = e_fm
-        self.last_theta_rel = theta_rel
         self.last_action = action.copy()
 
         return obs, reward, terminated, truncated, info
@@ -335,7 +357,6 @@ class TrainingWrapper(gym.Wrapper):
         obs, info = self.env.reset(**kwargs)
         self.last_action = np.zeros(2)
         self.last_e_fm = obs[0]
-        self.last_theta_rel = obs[1]
         return obs, info
 
 
@@ -425,9 +446,8 @@ def evaluate_agent(agent, env, num_episodes=10, render=False):
     total_rewards = []
     episode_lengths = []
 
-    # 获取环境的成功阈值
-    e_fm_limit = env.env.e_fm_limit  # 0.1
-    theta_limit = env.env.theta_limit  # 12度
+    e_fm_limit = env.env.e_fm_limit
+    theta_limit = env.env.theta_limit
 
     for episode in range(num_episodes):
         state, _ = env.reset()
@@ -450,11 +470,9 @@ def evaluate_agent(agent, env, num_episodes=10, render=False):
         e_fm = env.env.x_fm - env.env.track_centerline(y_fm)
         theta_rel = env.env.theta - env.env.track_angle(y_fm)
 
-        # 修正成功条件
-        success = (terminated and
-                   y_fm >= env.env.y_end and
-                   abs(e_fm) < e_fm_limit and
-                   abs(theta_rel) < theta_limit)
+        # 成功条件：到达机库 (y_fm <= 0)
+        success = (terminated and y_fm <= env.env.y_end and
+                   abs(e_fm) < e_fm_limit and abs(theta_rel) < theta_limit)
 
         if success:
             success_count += 1
@@ -464,7 +482,7 @@ def evaluate_agent(agent, env, num_episodes=10, render=False):
 
         status = "✓ 成功" if success else "✗ 失败"
         print(f"评估 Episode {episode + 1}: {status} | Reward={episode_reward:.1f}, "
-              f"Length={step_count}, y_fm={y_fm:.2f}, e_fm={e_fm:.3f}, theta={np.rad2deg(theta_rel):.1f}°")
+              f"Length={step_count}, y={y_fm:.2f}, e={e_fm:.3f}, theta={np.rad2deg(theta_rel):.1f}°")
 
     avg_reward = np.mean(total_rewards)
     avg_length = np.mean(episode_lengths)
@@ -484,33 +502,40 @@ def evaluate_agent(agent, env, num_episodes=10, render=False):
     }
 
 
-# ========== 课程学习阶段 ==========
-def curriculum_learning_phase(agent, env, config, visualizer, phase_name, num_episodes, easy_mode=False):
-    """课程学习阶段"""
-    print(f"\n{'=' * 60}")
-    print(f"开始课程学习阶段: {phase_name}")
-    print(f"简单模式: {easy_mode}")
-    print(f"Episode数: {num_episodes}")
-    print(f"{'=' * 60}")
+# ========== 主训练函数 ==========
+def train_sac(config):
+    """SAC训练主函数"""
 
-    env.env.easy_mode = easy_mode
+    # 创建环境
+    base_env = HelicopterInboundKinematicsEnv(render_mode=None)
+    env = TrainingWrapper(base_env, config)
 
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+
+    print("=" * 60)
+    print("开始训练 SAC (Soft Actor-Critic) 算法")
+    print(f"状态维度: {state_dim}")
+    print(f"动作维度: {action_dim}")
+    print(f"动作空间: vx∈[-1,1], vy∈[0.005,0.03]")
+    print(f"运动方向: 从降落区域(y=3.55)向机库(y=0)")
+    print(f"设备: {config['device']}")
+    print(f"保存目录: {config['save_dir']}")
+    print("=" * 60)
+
+    # 创建智能体
+    agent = SACAgent(state_dim, action_dim, config)
+
+    # 可视化器
+    visualizer = TrainingVisualizer(save_dir=config['save_dir'])
+
+    training_start_time = time.time()
     best_reward = -np.inf
     success_count = 0
+    e_fm_limit = env.env.e_fm_limit
+    theta_limit = env.env.theta_limit
 
-    # 获取环境的成功阈值
-    e_fm_limit = env.env.e_fm_limit  # 0.1
-    theta_limit = env.env.theta_limit  # 12度
-
-    # 添加精度统计
-    precision_stats = {
-        'avg_e_fm': [],
-        'avg_theta_rel': [],
-        'perfect_count': 0,
-        'good_count': 0
-    }
-
-    for episode in range(1, num_episodes + 1):
+    for episode in range(1, config['max_episodes'] + 1):
         state, _ = env.reset()
         episode_reward = 0
         episode_length = 0
@@ -518,7 +543,8 @@ def curriculum_learning_phase(agent, env, config, visualizer, phase_name, num_ep
         truncated = False
 
         while not (terminated or truncated):
-            deterministic = episode < 100 and easy_mode
+            # 早期使用确定性动作
+            deterministic = episode < 100
             action = agent.select_action(state, deterministic=deterministic)
 
             next_state, reward, terminated, truncated, _ = env.step(action)
@@ -536,106 +562,46 @@ def curriculum_learning_phase(agent, env, config, visualizer, phase_name, num_ep
         agent.episode_rewards.append(episode_reward)
         agent.episode_lengths.append(episode_length)
 
-        # 获取最终状态
+        # 判断成功（到达机库 y_fm <= 0）
         y_fm = env.env.y_fm
         e_fm = env.env.x_fm - env.env.track_centerline(y_fm)
         theta_rel = env.env.theta - env.env.track_angle(y_fm)
 
-        # 统计到达时的精度
-        if terminated:
-            precision_stats['avg_e_fm'].append(abs(e_fm))
-            precision_stats['avg_theta_rel'].append(abs(theta_rel))
-
-            if abs(e_fm) < 0.03 and abs(theta_rel) < 0.02:
-                precision_stats['perfect_count'] += 1
-            elif abs(e_fm) < 0.05 and abs(theta_rel) < 0.05:
-                precision_stats['good_count'] += 1
-
-        # 成功条件：到达终点(y>=3.55) 且 偏差<0.1m 且 偏角<12度
-        success = (terminated and
-                   y_fm >= env.env.y_end and
-                   abs(e_fm) < e_fm_limit and
-                   abs(theta_rel) < theta_limit)
+        success = (terminated and y_fm <= env.env.y_end and
+                   abs(e_fm) < e_fm_limit and abs(theta_rel) < theta_limit)
 
         if success:
             success_count += 1
-            print(f"🎉 Episode {episode} 成功入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°")
 
         visualizer.update(episode, episode_reward, episode_length, success)
 
+        # 保存最佳模型
         if episode_reward > best_reward:
             best_reward = episode_reward
-            agent.save_model(f"{config['save_dir']}/{phase_name}_best_model.pt")
+            agent.save_model(f"{config['save_dir']}/best_model.pt")
 
+        # 定期打印
         if episode % config['log_interval'] == 0:
             recent_rewards = agent.episode_rewards[-100:] if len(
                 agent.episode_rewards) >= 100 else agent.episode_rewards
             recent_success_rate = success_count / episode if episode > 0 else 0
-            print(f"Phase {phase_name} Episode {episode}/{num_episodes} | "
+            elapsed = time.time() - training_start_time
+
+            print(f"Episode {episode}/{config['max_episodes']} | "
                   f"Reward: {episode_reward:.1f} | "
                   f"Avg Reward: {np.mean(recent_rewards):.1f} | "
                   f"Success Rate: {recent_success_rate:.2%} | "
                   f"Alpha: {agent.alpha.item():.3f} | "
-                  f"Buffer: {len(agent.buffer)}")
+                  f"Buffer: {len(agent.buffer)} | "
+                  f"Time: {elapsed / 60:.1f}min")
 
-        # 定期打印精度统计
-        if episode % 50 == 0:
-            if precision_stats['avg_e_fm']:
-                avg_e = np.mean(precision_stats['avg_e_fm'][-50:])
-                avg_theta = np.rad2deg(np.mean(precision_stats['avg_theta_rel'][-50:]))
-                print(f"📊 最近50次到达 - 平均偏差: {avg_e:.3f}m, 平均偏角: {avg_theta:.1f}°, "
-                      f"完美: {precision_stats['perfect_count']}, 优秀: {precision_stats['good_count']}")
-
-    return success_count / num_episodes
-
-
-# ========== 主训练函数 ==========
-def train_sac(config):
-    """SAC训练主函数（带课程学习）"""
-
-    # 创建环境
-    base_env = HelicopterInboundKinematicsEnv(render_mode=None)
-    env = TrainingWrapper(base_env, config)
-
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
-
-    # 创建智能体
-    agent = SACAgent(state_dim, action_dim, config)
-
-    # 可视化器
-    visualizer = TrainingVisualizer(save_dir=config['save_dir'])
-
-    training_start_time = time.time()
-
-    print("=" * 60)
-    print("开始训练 SAC (Soft Actor-Critic) 算法")
-    print(f"状态维度: {state_dim}")
-    print(f"动作维度: {action_dim}")
-    print(f"动作空间: vx∈[-1,1], vy∈[0.02,0.1]")
-    print(f"设备: {agent.device}")
-    print(f"保存目录: {config['save_dir']}")
-    print("=" * 60)
-
-    # 课程学习阶段1：简单模式（靠近机库）
-    phase1_success = curriculum_learning_phase(
-        agent, env, config, visualizer,
-        phase_name="phase1_easy",
-        num_episodes=config['curriculum_episodes_1'],
-        easy_mode=True
-    )
-
-    print(f"\n阶段1完成，成功率: {phase1_success:.2%}")
-
-    # 课程学习阶段2：正常模式（从起点开始）
-    phase2_success = curriculum_learning_phase(
-        agent, env, config, visualizer,
-        phase_name="phase2_normal",
-        num_episodes=config['curriculum_episodes_2'],
-        easy_mode=False
-    )
-
-    print(f"\n阶段2完成，成功率: {phase2_success:.2%}")
+        # 定期评估
+        if episode % config['eval_interval'] == 0:
+            print("\n" + "-" * 40)
+            print("开始评估...")
+            eval_results = evaluate_agent(agent, env, num_episodes=20, render=False)
+            print(f"评估成功率: {eval_results['success_rate']:.2%}")
+            print("-" * 40 + "\n")
 
     # 训练结束
     training_time = time.time() - training_start_time
@@ -677,36 +643,32 @@ def train_sac(config):
 # ========== 主程序 ==========
 if __name__ == "__main__":
 
-    # SAC训练配置（修正版）
+    # SAC训练配置
     config = {
         # SAC超参数
         'gamma': 0.99,
         'tau': 0.005,
-        'alpha_lr': 2e-4,
+        'alpha_lr': 3e-4,
 
         # 网络参数
-        'hidden_dim': 128,
+        'hidden_dim': 64,
 
         # 学习率
-        'actor_lr': 2e-4,
-        'critic_lr': 2e-4,
+        'actor_lr': 3e-4,
+        'critic_lr': 3e-4,
 
         # 训练参数
-        'max_episodes': 2000,
-        'batch_size': 128,
-        'buffer_capacity': 200000,
-        'learning_starts': 2000,  # 减少预热
+        'max_episodes': 1500,
+        'batch_size': 64,
+        'buffer_capacity': 100000,
+        'learning_starts': 1000,
         'updates_per_step': 1,
-
-        # 课程学习参数
-        'curriculum_episodes_1': 200,  # 简单模式400集
-        'curriculum_episodes_2': 800,  # 正常模式1600集
 
         # 其他
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'save_dir': f'SAC_fixed_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
-        'log_interval':50,
-        'eval_interval': 200,
+        'save_dir': f'SAC_direct_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
+        'log_interval': 20,
+        'eval_interval': 100,
     }
 
     # 创建保存目录
@@ -735,5 +697,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n训练出错: {e}")
         import traceback
-
         traceback.print_exc()
