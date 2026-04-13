@@ -1,12 +1,18 @@
 """
-直升机自动牵引入库环境
+直升机自动牵引入库环境 - 高速优化版
 运动方向：从降落区域（y=3.55）向机库（y=0）运动
 轨道：直线段1(机库侧 x=0) → 弯道(向右偏移到0.38) → 直线段2(降落区域侧 x=0.38)
+【优化：移除所有渲染开销，只保留核心仿真逻辑】
 """
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+
+# 禁用matplotlib渲染（完全移除）
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端，避免任何GUI开销
+
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon, Circle, Rectangle, Arc
 from matplotlib.animation import FuncAnimation
@@ -17,13 +23,13 @@ plt.rcParams["axes.unicode_minus"] = False
 
 class HelicopterInboundKinematicsEnv(gym.Env):
     """
-    直升机自动牵引入库环境
+    直升机自动牵引入库环境 - 高速版
     运动方向：从降落区域（y=3.55）向机库（y=0）运动
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    def __init__(self, render_mode=None, easy_mode=False):
+    def __init__(self, render_mode=None, easy_mode=False, fast_mode=True):
         super().__init__()
 
         # ========== 几何参数 ==========
@@ -75,6 +81,7 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         self.current_steps = 0
         self.max_steps = 5000
         self.trajectory = []
+        self.fast_mode = fast_mode  # 快速模式：减少轨迹记录
 
         self.last_e_fm = None
         self.last_theta_rel = None
@@ -90,12 +97,24 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         self.hangar_width = 0.8  # 机库宽度 (m)
         self.hangar_height = 1.5  # 机库高度 (m)
 
-    def track_centerline(self, y):
-        """
-        轨道中心线函数
-        y: 从机库开始的纵向距离 (0-3.55m)
-        直升机从 y=3.55 向 y=0 运动
-        """
+        # 预计算轨道中心线（加速）
+        self._precompute_track()
+
+    def _precompute_track(self):
+        """预计算轨道中心线和导数（加速）"""
+        self._track_cache = {}
+        self._track_deriv_cache = {}
+        self._track_angle_cache = {}
+
+        # 预计算关键y值
+        y_values = np.linspace(-0.5, self.y_start + 0.5, 1000)
+        for y in y_values:
+            self._track_cache[y] = self._track_centerline_calc(y)
+            self._track_deriv_cache[y] = self._track_derivative_calc(y)
+            self._track_angle_cache[y] = np.arctan2(self._track_deriv_cache[y], 1.0)
+
+    def _track_centerline_calc(self, y):
+        """轨道中心线函数（计算版本）"""
         if y <= self.y_curve_start:
             return 0.0
         elif y <= self.y_curve_end:
@@ -104,8 +123,8 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         else:
             return self.curve_dx
 
-    def track_derivative(self, y):
-        """轨道中心线导数 dx/dy"""
+    def _track_derivative_calc(self, y):
+        """轨道中心线导数 dx/dy（计算版本）"""
         if y <= self.y_curve_start:
             return 0.0
         elif y <= self.y_curve_end:
@@ -116,9 +135,30 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         else:
             return 0.0
 
+    def track_centerline(self, y):
+        """轨道中心线函数（带缓存）"""
+        # 四舍五入到最近0.01米以使用缓存
+        y_key = round(y * 100) / 100
+        if y_key in self._track_cache:
+            return self._track_cache[y_key]
+        else:
+            return self._track_centerline_calc(y)
+
+    def track_derivative(self, y):
+        """轨道中心线导数 dx/dy（带缓存）"""
+        y_key = round(y * 100) / 100
+        if y_key in self._track_deriv_cache:
+            return self._track_deriv_cache[y_key]
+        else:
+            return self._track_derivative_calc(y)
+
     def track_angle(self, y):
-        """轨道切线角度 (rad)"""
-        return np.arctan2(self.track_derivative(y), 1.0)
+        """轨道切线角度 (rad)（带缓存）"""
+        y_key = round(y * 100) / 100
+        if y_key in self._track_angle_cache:
+            return self._track_angle_cache[y_key]
+        else:
+            return np.arctan2(self.track_derivative(y), 1.0)
 
     def update_kinematics(self, vx_cmd, vy_cmd, dt):
         """
@@ -157,7 +197,7 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         self.tail_angle = np.clip(self.tail_angle + omega * dt * 0.5, -0.3, 0.3)
 
     def compute_reward(self, e_fm, theta_rel, y_fm):
-        """平衡版奖励函数 - 确保成功时有正奖励"""
+        """平衡版奖励函数 - 确保成功时有正奖励（完全保持原样）"""
         reward = 0.0
 
         # ========== 1. 精度惩罚（降低权重，使用线性） ==========
@@ -205,19 +245,25 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         if y_fm <= self.y_end:
             if abs(e_fm) < 0.03 and abs(theta_rel) < 0.02:
                 reward += 800  # 完美入库，确保正奖励
-                print(f"🏆 完美入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
+                # 快速模式下减少打印
+                if not self.fast_mode:
+                    print(f"🏆 完美入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
             elif abs(e_fm) < 0.05 and abs(theta_rel) < 0.05:
                 reward += 500  # 优秀入库
-                print(f"⭐ 优秀入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
+                if not self.fast_mode:
+                    print(f"⭐ 优秀入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
             elif abs(e_fm) < 0.08 and abs(theta_rel) < 0.08:
                 reward += 300  # 良好入库
-                print(f"✓ 良好入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
+                if not self.fast_mode:
+                    print(f"✓ 良好入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
             elif abs(e_fm) < 0.1 and abs(theta_rel) < 0.1:
                 reward += 150  # 及格入库
-                print(f"⚠️ 及格入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
+                if not self.fast_mode:
+                    print(f"⚠️ 及格入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
             else:
                 reward -= 80  # 到达但位姿差
-                print(f"✗ 到达但位姿不佳 | 偏差: {e_fm:.3f}m, 偏角: {np.rad2deg(theta_rel):.1f}°")
+                if not self.fast_mode:
+                    print(f"✗ 到达但位姿不佳 | 偏差: {e_fm:.3f}m, 偏角: {np.rad2deg(theta_rel):.1f}°")
 
         return reward
 
@@ -244,14 +290,20 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         self.y_p = self.y_fm - self.L_PFM * np.cos(self.theta)
 
         self.current_steps = 0
-        self.trajectory = []
+
+        # 快速模式下减少轨迹记录
+        if not self.fast_mode:
+            self.trajectory = []
+        else:
+            self.trajectory = []  # 仍然初始化，但记录频率降低
 
         obs = self._get_obs()
         self.last_e_fm = obs[0]
         self.last_theta_rel = obs[1]
         self.last_y = self.y_fm
 
-        self._record_state()
+        if not self.fast_mode:
+            self._record_state()
 
         return obs, {}
 
@@ -274,15 +326,27 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         ], dtype=np.float32)
 
     def _record_state(self):
-        """记录状态"""
-        self.trajectory.append({
-            'x_fm': self.x_fm,
-            'y_fm': self.y_fm,
-            'theta': self.theta,
-            'x_p': self.x_p,
-            'y_p': self.y_p,
-            'tail_angle': self.tail_angle
-        })
+        """记录状态 - 快速模式下减少记录频率"""
+        if self.fast_mode:
+            # 每10步记录一次，减少内存和计算
+            if self.current_steps % 10 == 0:
+                self.trajectory.append({
+                    'x_fm': self.x_fm,
+                    'y_fm': self.y_fm,
+                    'theta': self.theta,
+                    'x_p': self.x_p,
+                    'y_p': self.y_p,
+                    'tail_angle': self.tail_angle
+                })
+        else:
+            self.trajectory.append({
+                'x_fm': self.x_fm,
+                'y_fm': self.y_fm,
+                'theta': self.theta,
+                'x_p': self.x_p,
+                'y_p': self.y_p,
+                'tail_angle': self.tail_angle
+            })
 
     def step(self, action):
         """执行一步"""
@@ -295,14 +359,16 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         self.last_vx_cmd = vx_cmd
 
         self.update_kinematics(vx_cmd, vy, dt)
-        self._record_state()
+        self.current_steps += 1
+
+        if not self.fast_mode:
+            self._record_state()
 
         e_fm = self.x_fm - self.track_centerline(self.y_fm)
         theta_rel = self.theta - self.track_angle(self.y_fm)
 
         reward = self.compute_reward(e_fm, theta_rel, self.y_fm)
 
-        self.current_steps += 1
         self.last_e_fm = e_fm
         self.last_theta_rel = theta_rel
 
@@ -322,7 +388,10 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         return self._get_obs(), reward, terminated, truncated, {}
 
     def render(self):
-        """渲染"""
+        """渲染 - 快速模式下禁用"""
+        if self.fast_mode:
+            return
+
         if self.render_mode is None:
             return
 
@@ -568,7 +637,7 @@ class HelicopterInboundKinematicsEnv(gym.Env):
 
 
 if __name__ == "__main__":
-    env = HelicopterInboundKinematicsEnv()
+    env = HelicopterInboundKinematicsEnv(fast_mode=False)
 
     # 提高横向速度
     env.VX_MAX = 0.02
@@ -636,8 +705,6 @@ if __name__ == "__main__":
 
             if step % 500 == 0:
                 print(f"  Step {step}: y={obs[4]:.2f}, e={obs[0]:.3f}, theta={np.rad2deg(obs[1]):.1f}°")
-
-            env.render()
 
             if terminated or truncated:
                 e_fm_final = obs[0]
