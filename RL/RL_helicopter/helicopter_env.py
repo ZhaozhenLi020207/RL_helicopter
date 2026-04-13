@@ -241,6 +241,13 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         # ========== 5. 存活奖励（提高） ==========
         reward += 0.1
 
+        # 在到达奖励之前添加（约第230行）
+        # 接近终点时的辅助奖励
+        if y_fm < 0.5:  # 距离终点0.5米内
+            # 鼓励减速和调正
+            reward += 5.0 * (1 - abs(e_fm) / 0.15)  # 偏差越小奖励越大
+            reward += 3.0 * (1 - abs(theta_rel) / 0.26)  # 偏角奖励
+
         # ========== 6. 到达奖励（大幅提高，确保总奖励为正） ==========
         if y_fm <= self.y_end:
             if abs(e_fm) < 0.03 and abs(theta_rel) < 0.02:
@@ -635,89 +642,3 @@ class HelicopterInboundKinematicsEnv(gym.Env):
             self.fig = None
             self.ax = None
 
-
-if __name__ == "__main__":
-    env = HelicopterInboundKinematicsEnv(fast_mode=False)
-
-    # 提高横向速度
-    env.VX_MAX = 0.02
-
-    print("=" * 50)
-    print("直升机入库环境测试 - 提高横向速度")
-    print(f"横向速度: {env.VX_MAX}m/s, 纵向速度: {env.VY_MAX}m/s")
-    print(f"成功条件: 偏差<{env.e_fm_limit}m, 偏角<{np.rad2deg(env.theta_limit):.0f}°")
-    print("=" * 50)
-
-    success_count = 0
-
-    for episode in range(10):
-        obs, _ = env.reset()
-        print(f"\nEpisode {episode + 1} - 起始 y={obs[4]:.2f}m")
-
-        total_reward = 0
-
-        # 强偏差PID
-        integral_e = 0
-        last_e = 0
-        kp_e = 10.0
-        ki_e = 0.2
-        kd_e = 1.0
-
-        # 偏角PID
-        integral_theta = 0
-        last_theta = 0
-        kp_theta = 8.0
-        ki_theta = 0.1
-        kd_theta = 1.5
-
-        for step in range(3000):  # 减少步数因为速度更快
-            e_fm, theta_rel, e_p, tail_angle, y_remaining = obs
-
-            # 偏差PID
-            integral_e += e_fm * 0.05
-            integral_e = np.clip(integral_e, -0.3, 0.3)
-            derivative_e = (e_fm - last_e) / 0.05
-            vx_from_e = -(kp_e * e_fm + ki_e * integral_e + kd_e * derivative_e)
-
-            # 偏角PID
-            integral_theta += theta_rel * 0.05
-            integral_theta = np.clip(integral_theta, -0.2, 0.2)
-            derivative_theta = (theta_rel - last_theta) / 0.05
-            vx_from_theta = -(kp_theta * theta_rel + ki_theta * integral_theta + kd_theta * derivative_theta)
-
-            # 综合控制
-            vx_sign = np.clip((vx_from_e * 0.7 + vx_from_theta * 0.3), -1, 1)
-
-            # 速度策略
-            if y_remaining < 0.3:
-                vy = 0.008
-            elif y_remaining < 0.8:
-                vy = 0.015
-            else:
-                vy = 0.025
-
-            last_e = e_fm
-            last_theta = theta_rel
-
-            action = np.array([vx_sign, vy])
-            obs, reward, terminated, truncated, _ = env.step(action)
-            total_reward += reward
-
-            if step % 500 == 0:
-                print(f"  Step {step}: y={obs[4]:.2f}, e={obs[0]:.3f}, theta={np.rad2deg(obs[1]):.1f}°")
-
-            if terminated or truncated:
-                e_fm_final = obs[0]
-                theta_final = obs[1]
-                success = terminated and abs(e_fm_final) < 0.1 and abs(theta_final) < np.deg2rad(12)
-
-                if success:
-                    success_count += 1
-                    print(f"🎉 成功入库！")
-                status = "✓ 成功入库" if success else "✗ 失败"
-                print(
-                    f"{status} | 步数: {step + 1} | y={obs[4]:.2f}m | 偏差={e_fm_final:.3f}m | 偏角={np.rad2deg(theta_final):.1f}° | 总奖励={total_reward:.1f}")
-                break
-
-    print(f"\n成功率: {success_count}/10 = {success_count * 10}%")
-    env.close()
