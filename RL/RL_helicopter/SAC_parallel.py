@@ -108,7 +108,7 @@ class ParallelEnvManager:
 
         # 创建多个独立环境
         for _ in range(num_envs):
-            env = HelicopterInboundKinematicsEnv(render_mode=None, fast_mode=True, easy_mode=easy_mode)
+            env = HelicopterInboundKinematicsEnv(render_mode=None, fast_mode=True)
             self.envs.append(env)
 
         # 重置所有环境
@@ -452,7 +452,6 @@ def train_sac_parallel(config):
     # 创建并行环境管理器
     env_manager = ParallelEnvManager(
         num_envs=config['num_envs'],
-        easy_mode=config.get('easy_mode', False)
     )
 
     state_dim = 5
