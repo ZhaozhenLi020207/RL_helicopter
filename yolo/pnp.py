@@ -171,7 +171,7 @@ def helicopter_deck_pose_estimation(image_path):
 
 
 if __name__ == "__main__":
-    image_path = "test_image/helicopter_test2.png"  # 替换图片路径
+    image_path = "../test_image/helicopter_test2.png"  # 替换图片路径
     try:
         helicopter_deck_pose_estimation(image_path)
     except Exception as e:

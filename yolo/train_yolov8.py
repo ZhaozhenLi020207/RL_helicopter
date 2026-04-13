@@ -14,7 +14,7 @@ EPOCHS = 50  # 训练轮数（新手建议30-50）
 BATCH_SIZE = 8  # 批次大小
 IMG_SIZE = 640  # 输入图片尺寸
 DEVICE = "cpu"  # 显卡ID
-SAVE_DIR = "runs/helicopter_train"  # 训练结果保存路径
+SAVE_DIR = "../runs/helicopter_train"  # 训练结果保存路径
 
 # 加载预训练模型
 print("加载预训练模型：", BASE_MODEL)

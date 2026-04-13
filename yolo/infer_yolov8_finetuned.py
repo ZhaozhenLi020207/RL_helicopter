@@ -8,7 +8,7 @@ warnings.filterwarnings("ignore")
 
 # 加载YOLOv8模型
 # 替换为微调后的模型路径（训练完成后在runs/helicopter_train/train/weights/下）
-FINETUNED_MODEL_PATH = "runs/helicopter_train/weights/best.pt"
+FINETUNED_MODEL_PATH = "../runs/helicopter_train/weights/best.pt"
 model = YOLO(FINETUNED_MODEL_PATH)
 
 # 甲板检测+位姿计算逻辑
@@ -162,7 +162,7 @@ def helicopter_pose_analysis_finetuned(image_path):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
     # 保存+显示
-    save_path = "result/finetuned_yolo_helicopter_result.png"
+    save_path = "../result/finetuned_yolo_helicopter_result.png"
     cv2.imwrite(save_path, img_display)
     print(f"\n 结果已保存：{save_path}")
     # 自适应窗口
@@ -177,7 +177,7 @@ def helicopter_pose_analysis_finetuned(image_path):
 # 运行入口
 if __name__ == "__main__":
     # 测试图片路径
-    TEST_IMAGE_PATH = "test_image/helicopter_test2.png"
+    TEST_IMAGE_PATH = "../test_image/helicopter_test2.png"
     try:
         helicopter_pose_analysis_finetuned(TEST_IMAGE_PATH)
     except Exception as e:
