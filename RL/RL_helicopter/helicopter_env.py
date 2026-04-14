@@ -29,7 +29,7 @@ class HelicopterInboundKinematicsEnv(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    def __init__(self, render_mode=None, easy_mode=False, fast_mode=True):
+    def __init__(self, render_mode=None, fast_mode=True):
         super().__init__()
 
         # ========== 几何参数 ==========
@@ -91,7 +91,6 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         self.render_mode = render_mode
         self.fig = None
         self.ax = None
-        self.easy_mode = easy_mode
 
         # 机库尺寸（能包住直升机）
         self.hangar_width = 0.8  # 机库宽度 (m)
@@ -197,97 +196,160 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         self.tail_angle = np.clip(self.tail_angle + omega * dt * 0.5, -0.3, 0.3)
 
     def compute_reward(self, e_fm, theta_rel, y_fm):
-        """平衡版奖励函数 - 确保成功时有正奖励（完全保持原样）"""
+        """
+        模块化奖励函数 - 基于多种奖励策略设计
+
+        策略清单：
+        1. 势能函数（距离终点）
+        2. 塑形奖励（偏差、偏角）
+        3. 相对改善奖励
+        4. 分阶段权重
+        5. 弯道跟随奖励
+        6. 终点高精度奖励
+        """
+
+        # ========== 可调参数 ==========
+        # 权重系数
+        W_PROGRESS = 2.0  # 前进奖励权重
+        W_ALIVE = 0.1  # 存活奖励
+        W_DEVIATION = 3.0  # 偏差惩罚权重
+        W_ANGLE = 2.0  # 偏角惩罚权重
+        W_IMPROVE_E = 1.5  # 偏差改善奖励
+        W_IMPROVE_THETA = 2.0  # 偏角改善奖励
+        W_CURVE_FOLLOW = 2.0  # 弯道跟随奖励
+        W_TERMINAL = 10.0  # 终点接近奖励
+
+        # 阶段阈值
+        CURVE_START = 1.4
+        CURVE_END = 2.65
+        TERMINAL_START = 0.5
+
+        # 成功阈值
+        SUCCESS_E = 0.05
+        SUCCESS_THETA = 0.05  # ~2.86°
+        PERFECT_E = 0.03
+        PERFECT_THETA = 0.02  # ~1.15°
+
         reward = 0.0
 
-        # ========== 1. 精度惩罚（降低权重，使用线性） ==========
-        e_penalty = 3.0 * abs(e_fm)  # 从指数改为线性
-        theta_penalty = 2.0 * abs(theta_rel)
-        reward -= e_penalty
-        reward -= theta_penalty
+        # ========== 1. 势能函数（基于距离终点） ==========
+        # 距离终点越近势能越高
+        potential = -y_fm  # 负距离
+        # 注：势能差在改善奖励中体现
 
-        # ========== 2. 精度奖励（提高） ==========
-        if abs(e_fm) < 0.03:
-            reward += 5.0
-        elif abs(e_fm) < 0.05:
-            reward += 3.0
-        elif abs(e_fm) < 0.08:
-            reward += 1.0
+        # ========== 2. 塑形奖励 - 偏差惩罚 ==========
+        deviation_penalty = -W_DEVIATION * abs(e_fm)
+        reward += deviation_penalty
 
-        if abs(theta_rel) < 0.02:
-            reward += 3.0
-        elif abs(theta_rel) < 0.05:
-            reward += 2.0
-        elif abs(theta_rel) < 0.08:
-            reward += 0.8
+        # ========== 3. 塑形奖励 - 偏角惩罚 ==========
+        angle_penalty = -W_ANGLE * abs(theta_rel)
+        reward += angle_penalty
 
-        # ========== 3. 改善奖励 ==========
+        # ========== 4. 前进奖励（稠密） ==========
+        # 基于y位置的前进奖励
+        progress = (self.y_start - y_fm) / self.y_start
+        reward += W_PROGRESS * progress
+
+        # ========== 5. 相对改善奖励 ==========
         if self.last_e_fm is not None:
+            # 偏差改善
             e_improve = abs(self.last_e_fm) - abs(e_fm)
-            theta_improve = abs(self.last_theta_rel) - abs(theta_rel)
-
             if e_improve > 0:
-                reward += 2.0 * e_improve
+                reward += W_IMPROVE_E * e_improve
             elif e_improve < -0.02:
                 reward -= 0.5
 
+            # 偏角改善
+            theta_improve = abs(self.last_theta_rel) - abs(theta_rel)
             if theta_improve > 0:
-                reward += 1.0 * theta_improve
+                reward += W_IMPROVE_THETA * theta_improve
+            elif theta_improve < -0.02:
+                reward -= 0.5
 
-        # ========== 4. 前进奖励 ==========
-        progress = (self.y_start - y_fm) / self.y_start
-        reward += 1.0 * progress  # 降低前进奖励权重
+        # ========== 6. 存活奖励 ==========
+        reward += W_ALIVE
 
-        # ========== 5. 存活奖励（提高） ==========
-        reward += 0.1
+        # ========== 7. 分阶段权重 - 弯道区域 ==========
+        if CURVE_START < y_fm < CURVE_END:
+            # 弯道区域：提高偏角重要性
+            track_angle = self.track_angle(y_fm)
+            angle_diff = abs(theta_rel - track_angle)
 
-        # 在到达奖励之前添加（约第230行）
-        # 接近终点时的辅助奖励
-        if y_fm < 0.5:  # 距离终点0.5米内
-            # 鼓励减速和调正
-            reward += 5.0 * (1 - abs(e_fm) / 0.15)  # 偏差越小奖励越大
-            reward += 3.0 * (1 - abs(theta_rel) / 0.26)  # 偏角奖励
+            # 弯道跟随奖励
+            if angle_diff < 0.05:  # ~2.86°
+                reward += W_CURVE_FOLLOW * 2.0
+            elif angle_diff < 0.10:  # ~5.73°
+                reward += W_CURVE_FOLLOW * 1.0
+            elif angle_diff < 0.15:  # ~8.59°
+                reward += W_CURVE_FOLLOW * 0.5
 
-        # ========== 6. 到达奖励（大幅提高，确保总奖励为正） ==========
+            # 弯道区域额外偏角惩罚
+            reward -= 1.0 * abs(theta_rel)
+
+        # ========== 8. 分阶段权重 - 终点区域 ==========
+        if y_fm < TERMINAL_START:
+            # 终点区域：提高偏差重要性，增加精度奖励
+            terminal_factor = (TERMINAL_START - y_fm) / TERMINAL_START
+
+            # 精度奖励（随距离指数增长）
+            e_bonus = W_TERMINAL * (1 - min(1.0, abs(e_fm) / 0.1)) * terminal_factor
+            theta_bonus = W_TERMINAL * 0.8 * (1 - min(1.0, abs(theta_rel) / 0.17)) * terminal_factor
+            reward += e_bonus + theta_bonus
+
+            # 终点区域额外偏差惩罚
+            reward -= 2.0 * abs(e_fm) * (1 + terminal_factor)
+
+            # 鼓励减速（可选）
+            if hasattr(self, 'last_vx_cmd') and self.last_vx_cmd is not None:
+                # 速度越小奖励越大
+                speed_penalty = -0.5 * abs(self.last_vx_cmd)
+                reward += speed_penalty
+
+        # ========== 9. 防止超限惩罚（软约束） ==========
+        # 偏差接近0.5m时开始惩罚
+        if abs(e_fm) > 0.4:
+            overflow = (abs(e_fm) - 0.4) / 0.1  # 0-1之间
+            reward -= 5.0 * overflow
+
+        # 偏角接近45°时开始惩罚
+        if abs(theta_rel) > np.deg2rad(35):
+            overflow = (abs(theta_rel) - np.deg2rad(35)) / np.deg2rad(10)
+            reward -= 8.0 * overflow
+
+        # ========== 10. 成功/终止奖励 ==========
         if y_fm <= self.y_end:
-            if abs(e_fm) < 0.03 and abs(theta_rel) < 0.02:
-                reward += 800  # 完美入库，确保正奖励
-                # 快速模式下减少打印
-                if not self.fast_mode:
-                    print(f"🏆 完美入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
-            elif abs(e_fm) < 0.05 and abs(theta_rel) < 0.05:
-                reward += 500  # 优秀入库
-                if not self.fast_mode:
-                    print(f"⭐ 优秀入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
-            elif abs(e_fm) < 0.08 and abs(theta_rel) < 0.08:
-                reward += 300  # 良好入库
-                if not self.fast_mode:
-                    print(f"✓ 良好入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
-            elif abs(e_fm) < 0.1 and abs(theta_rel) < 0.1:
-                reward += 150  # 及格入库
-                if not self.fast_mode:
-                    print(f"⚠️ 及格入库！偏差={e_fm:.3f}m, 偏角={np.rad2deg(theta_rel):.1f}°, 总奖励≈{reward:.0f}")
+            # 到达终点
+            if abs(e_fm) < SUCCESS_E and abs(theta_rel) < SUCCESS_THETA:
+                # 成功入库
+                if abs(e_fm) < PERFECT_E and abs(theta_rel) < PERFECT_THETA:
+                    reward += 1000  # 完美入库
+                    if not self.fast_mode:
+                        print(f"🏆 完美入库！e={e_fm:.3f}m, θ={np.rad2deg(theta_rel):.1f}°")
+                else:
+                    reward += 500  # 成功入库
+                    if not self.fast_mode:
+                        print(f"✓ 成功入库！e={e_fm:.3f}m, θ={np.rad2deg(theta_rel):.1f}°")
             else:
-                reward -= 80  # 到达但位姿差
+                # 到达但精度不够
+                reward -= 100
                 if not self.fast_mode:
-                    print(f"✗ 到达但位姿不佳 | 偏差: {e_fm:.3f}m, 偏角: {np.rad2deg(theta_rel):.1f}°")
+                    print(f"✗ 到达但精度不足 | e={e_fm:.3f}m, θ={np.rad2deg(theta_rel):.1f}°")
+
+        # ========== 11. 记录状态供下一步使用 ==========
+        self.last_e_fm = e_fm
+        self.last_theta_rel = theta_rel
+        self.last_y = y_fm
 
         return reward
 
     def reset(self, seed=None, options=None):
-        """重置环境"""
+        """重置环境 - 只有正常模式"""
         super().reset(seed=seed)
 
-        if self.easy_mode:
-            # 简单模式：从靠近机库的位置开始（y较小）
-            self.y_fm = self.np_random.uniform(0, 1.5)
-            e_fm_init = self.np_random.uniform(-0.1, 0.1)
-            self.theta = self.np_random.uniform(-np.deg2rad(5), np.deg2rad(5))
-        else:
-            # 正常模式：从起点附近开始（y接近3.55）
-            self.y_fm = self.np_random.uniform(2.8, self.y_start)
-            e_fm_init = self.np_random.uniform(-0.25, 0.25)
-            self.theta = self.np_random.uniform(-np.deg2rad(12), np.deg2rad(12))
+        # 正常模式：从起点附近开始（y接近3.55）
+        self.y_fm = self.np_random.uniform(2.8, self.y_start)
+        e_fm_init = self.np_random.uniform(-0.25, 0.25)
+        self.theta = self.np_random.uniform(-np.deg2rad(12), np.deg2rad(12))
 
         track_x = self.track_centerline(self.y_fm)
         self.x_fm = track_x + e_fm_init
@@ -308,6 +370,7 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         self.last_e_fm = obs[0]
         self.last_theta_rel = obs[1]
         self.last_y = self.y_fm
+        self.last_vx_cmd = 0.0
 
         if not self.fast_mode:
             self._record_state()
@@ -383,9 +446,8 @@ class HelicopterInboundKinematicsEnv(gym.Env):
         terminated = self.y_fm <= self.y_end
 
         # 失败条件
-        failed = (abs(e_fm) > 0.5 or
-                  abs(theta_rel) > np.deg2rad(45) or
-                  self.current_steps >= self.max_steps)
+        failed = (abs(e_fm) > 0.5 and abs(theta_rel) > np.deg2rad(45)) or \
+                 self.current_steps >= self.max_steps
 
         truncated = failed
 

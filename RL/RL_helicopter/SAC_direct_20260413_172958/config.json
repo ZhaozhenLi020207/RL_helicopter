@@ -1,0 +1,17 @@
+{
+    "gamma": 0.99,
+    "tau": 0.005,
+    "alpha_lr": 0.0003,
+    "hidden_dim": 256,
+    "actor_lr": 0.0003,
+    "critic_lr": 0.0003,
+    "max_episodes": 1500,
+    "batch_size": 256,
+    "buffer_capacity": 100000,
+    "learning_starts": 1000,
+    "updates_per_step": 8,
+    "device": "cuda",
+    "save_dir": "SAC_direct_20260413_172958",
+    "log_interval": 20,
+    "eval_interval": 100
+}

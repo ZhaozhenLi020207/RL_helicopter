@@ -1,0 +1,17 @@
+{
+    "gamma": 0.99,
+    "tau": 0.005,
+    "alpha_lr": 0.001,
+    "hidden_dim": 128,
+    "actor_lr": 0.001,
+    "critic_lr": 0.001,
+    "max_episodes": 1500,
+    "batch_size": 512,
+    "buffer_capacity": 200000,
+    "learning_starts": 2000,
+    "updates_per_step": 4,
+    "device": "cuda",
+    "save_dir": "SAC_Heli_Fast_20260413_192427",
+    "log_interval": 10,
+    "eval_interval": 200
+}
